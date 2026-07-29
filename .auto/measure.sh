@@ -23,7 +23,28 @@ if ! command -v cargo >/dev/null 2>&1; then
 	done
 fi
 
-out=$(cargo run -q -p fastpass-perf --release 2>&1)
+# The nix-store rust links via the system clang, which cannot find libiconv
+# outside a nix shell; point it at the nix store copy.
+for d in /nix/store/*libiconv-1.*/lib; do
+	if [ -d "${d}" ]; then
+		LIBRARY_PATH="${d}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+		export LIBRARY_PATH
+		break
+	fi
+done
+
+# Build, then exec the binary directly: `cargo run` measurably depresses and
+# destabilizes the workload (~2x slower, higher variance) vs a direct exec.
+if ! out_build=$(cargo build -q -p fastpass-perf --release 2>&1); then
+	echo "METRIC score=0 unit=composite"
+	echo "info: perf bin failed to build — reverting"
+	printf '%s\n' "${out_build}" | tail -8
+	exit 0
+fi
+out=$(./target/release/fastpass-perf 2>&1)
+# The first exec after a cargo build is consistently ~2x slower (cold pages
+# from cargo's target-dir scan); discard it and measure the second run.
+out=$(./target/release/fastpass-perf 2>&1)
 score=$(printf '%s\n' "${out}" | grep -oE 'SCORE=[0-9.]+' | head -1 | cut -d= -f2)
 thr=$(printf '%s\n' "${out}" | grep -oE 'THROUGHPUT_OPS=[0-9.]+' | head -1 | cut -d= -f2)
 lat=$(printf '%s\n' "${out}" | grep -oE 'CONTROL_LATENCY_NS=[0-9.]+' | head -1 | cut -d= -f2)

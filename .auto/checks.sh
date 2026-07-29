@@ -24,6 +24,16 @@ if ! command -v cargo >/dev/null 2>&1; then
 	done
 fi
 
+# The nix-store rust links via the system clang, which cannot find libiconv
+# outside a nix shell; point it at the nix store copy.
+for d in /nix/store/*libiconv-1.*/lib; do
+	if [ -d "${d}" ]; then
+		LIBRARY_PATH="${d}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+		export LIBRARY_PATH
+		break
+	fi
+done
+
 base=$(cat .auto/BASELINE 2>/dev/null || true)
 FROZEN=(
 	crates/fastpass-testkit

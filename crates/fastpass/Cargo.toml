@@ -10,9 +10,9 @@ description = "Priority-merge of two FIFO streams into one consumer (bombay card
 # the `Consumer::recv` policy starts as a naive user-biased stub and must be
 # grown until every property test passes.
 [dependencies]
-flume = { workspace = true }
+parking_lot = "0.12"
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 fastpass-testkit = { workspace = true }
