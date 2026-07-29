@@ -1,0 +1,22 @@
+[package]
+name = "fastpass-reference"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The gold implementation of the two-lane priority merge: strict priority with
+# an anti-starvation aging cap, built on two flume channels + a biased select.
+# It proves the property suite is satisfiable and serves as the benchmark
+# baseline. Kimi must NOT edit this crate.
+[dependencies]
+flume = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros"] }
+
+[dev-dependencies]
+fastpass-testkit = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
+
+[lints]
+workspace = true

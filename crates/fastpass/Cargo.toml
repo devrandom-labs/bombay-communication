@@ -1,0 +1,27 @@
+[package]
+name = "fastpass"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Priority-merge of two FIFO streams into one consumer (bombay card #225)."
+
+# This is KIMI'S target crate. The public API is fixed by the property suite;
+# the `Consumer::recv` policy starts as a naive user-biased stub and must be
+# grown until every property test passes.
+[dependencies]
+flume = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros"] }
+
+[dev-dependencies]
+fastpass-testkit = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "twolane"
+harness = false
+
+[lints]
+workspace = true
