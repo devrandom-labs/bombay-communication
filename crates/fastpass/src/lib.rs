@@ -120,10 +120,13 @@ impl Core {
     }
 }
 
-/// One slot of the user ring. `seq` is the Vyukov ticket: it equals the slot's
-/// position when free and `position + 1` once published.
+/// One slot of the user ring. `seq` is the Vyukov ticket, stored as `u32`
+/// (all ticket arithmetic is mod 2^32; the live-ticket window is bounded by
+/// `ring.len() < 2^31`, so truncation is sound): it equals the slot's
+/// position when free and `position + 1` once published. The narrow ticket
+/// halves slot memory for small `U`.
 struct Slot<U> {
-    seq: AtomicUsize,
+    seq: std::sync::atomic::AtomicU32,
     val: std::cell::UnsafeCell<MaybeUninit<U>>,
 }
 
@@ -175,7 +178,8 @@ impl<U> UserLane<U> {
             // SAFETY: `pos & mask` is always in bounds.
             let slot = unsafe { self.ring.get_unchecked(pos & mask) };
             let seq = slot.seq.load(Ordering::Acquire);
-            let diff = seq.wrapping_sub(pos) as isize;
+            let pos32 = pos as u32;
+            let diff = seq.wrapping_sub(pos32) as i32;
             if diff == 0 {
                 match self.tail.compare_exchange_weak(
                     pos,
@@ -188,7 +192,7 @@ impl<U> UserLane<U> {
                         // free `seq` ticket proves the previous occupant was
                         // consumed, so we hold exclusive access.
                         unsafe { slot.val.get().write(MaybeUninit::new(v)) };
-                        slot.seq.store(pos.wrapping_add(1), Ordering::Release);
+                        slot.seq.store(pos32.wrapping_add(1), Ordering::Release);
                         return Ok(());
                     }
                     Err(actual) => pos = actual,
@@ -207,14 +211,16 @@ impl<U> UserLane<U> {
         let head = self.head.load(Ordering::Relaxed);
         // SAFETY: `head & mask` is always in bounds.
         let slot = unsafe { self.ring.get_unchecked(head & self.mask()) };
-        if slot.seq.load(Ordering::Acquire) != head.wrapping_add(1) {
+        let head32 = head as u32;
+        if slot.seq.load(Ordering::Acquire) != head32.wrapping_add(1) {
             return None;
         }
         // SAFETY: the published `seq` (Acquire) orders the producer's write
         // before this read; only the consumer pops, and the slot is not
         // reused until re-ticketed below.
         let v = unsafe { slot.val.get().read().assume_init() };
-        slot.seq.store(head.wrapping_add(self.ring.len()), Ordering::Release);
+        slot.seq
+            .store(head32.wrapping_add(self.ring.len() as u32), Ordering::Release);
         self.head.store(head.wrapping_add(1), Ordering::Relaxed);
         // Wake one parked producer, if any — checked every 4th pop only;
         // a parked producer is also released by the consumer's pre-park
@@ -244,7 +250,7 @@ impl<U> Drop for UserLane<U> {
         let tail = *self.tail.get_mut();
         for pos in head..tail {
             let slot = &self.ring[pos & self.mask()];
-            if slot.seq.load(Ordering::Relaxed) == pos.wrapping_add(1) {
+            if slot.seq.load(Ordering::Relaxed) == (pos as u32).wrapping_add(1) {
                 // SAFETY: published and never consumed; exclusive `&mut self`.
                 unsafe { slot.val.get().drop_in_place() };
             }
@@ -712,7 +718,7 @@ impl<C, U> Consumer<C, U> {
         while head < tail {
             // SAFETY: `head & mask` is always in bounds.
             let slot = unsafe { self.usr.ring.get_unchecked(head & self.usr.mask()) };
-            if slot.seq.load(Ordering::Acquire) != head.wrapping_add(1) {
+            if slot.seq.load(Ordering::Acquire) != (head as u32).wrapping_add(1) {
                 break;
             }
             // SAFETY: published and unconsumed; the consumer is being torn
@@ -759,10 +765,14 @@ pub fn channel<C, U>(cfg: Config) -> (ControlSender<C>, UserSender<U>, Consumer<
     // which collapses at ring_len == 1 — and the rounded size IS the
     // effective capacity (in-ring backpressure).
     let capacity = cfg.user_capacity.max(2).next_power_of_two();
+    assert!(
+        capacity < (1 << 31),
+        "user_capacity {capacity} exceeds the u32 ticket window"
+    );
     let ring_len = capacity;
     let ring = (0..ring_len)
         .map(|i| Slot {
-            seq: AtomicUsize::new(i),
+            seq: std::sync::atomic::AtomicU32::new(i as u32),
             val: std::cell::UnsafeCell::new(MaybeUninit::uninit()),
         })
         .collect::<Vec<_>>()
