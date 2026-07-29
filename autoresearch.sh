@@ -1,9 +1,22 @@
 #!/usr/bin/env bash
 # Canonical benchmark entrypoint for the autoresearch loop.
 #
-# Workload: the fastpass property suite (.auto/measure.sh → cargo test -p fastpass).
-# Primary metric: tests_passing (count of passing tests; compile break parses as 0).
-# Deterministic: fixed test suite, no network, no time-of-day dependence.
+# Workload: the fastpass perf harness (.auto/measure.sh →
+# `cargo run -q -p fastpass-perf --release`), which merges the control and user
+# lanes of the current design and reports throughput plus control-latency-under-
+# backlog.
+#
+# Primary metric:   score            = throughput / control_latency_ns  (MAXIMIZE)
+# Secondary metrics: throughput_ops, control_latency_ns (parsed from the perf bin).
+#
+# Determinism: fixed perf workload, no network, no time-of-day dependence.
+# A compile/runtime failure makes measure.sh emit METRIC score=0, which passes
+# through unchanged so the loop auto-reverts.
+#
+# Correctness is NOT measured here; .auto/checks.sh is the hard gate
+# (conformance + zero-alloc + frozen files).
+#
+# Run UNSANDBOXED (cargo hangs under a sandboxed shell).
 set -uo pipefail
 
 # cargo is not on PATH in the loop's non-interactive shell; fall back to the
@@ -22,20 +35,19 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 export PATH
 
-out=$(bash .auto/measure.sh 2>&1) || {
-	echo "harness error: measure.sh failed" >&2
-	printf '%s\n' "$out" >&2
-	exit 1
-}
+out=$(bash .auto/measure.sh 2>&1)
 
-# Normalize "METRIC tests_passing=N unit=count" → "METRIC tests_passing=N".
-metric=$(printf '%s\n' "$out" | grep -oE 'tests_passing=[0-9]+' | head -n1)
-if [ -z "${metric}" ]; then
-	echo "harness error: no tests_passing metric in measure.sh output" >&2
+score=$(printf '%s\n' "$out" | grep -oE '^METRIC score=[0-9.]+' | head -n1 | cut -d= -f2)
+if [ -z "${score}" ]; then
+	echo "harness error: no score metric in measure.sh output" >&2
 	printf '%s\n' "$out" >&2
 	exit 1
 fi
 
-echo "METRIC ${metric}"
-printf '%s\n' "$out" | grep -E '^info:' || true
+thr=$(printf '%s\n' "$out" | grep -oE 'throughput_ops=[0-9.]+' | head -n1 | cut -d= -f2)
+lat=$(printf '%s\n' "$out" | grep -oE 'control_latency_ns=[0-9.]+' | head -n1 | cut -d= -f2)
+
+echo "METRIC score=${score}"
+[ -n "${thr}" ] && echo "METRIC throughput_ops=${thr}"
+[ -n "${lat}" ] && echo "METRIC control_latency_ns=${lat}"
 exit 0
