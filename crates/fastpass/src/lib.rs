@@ -147,22 +147,19 @@ impl<C, U> Consumer<C, U> {
     ///
     /// Returns `None` once both lanes are closed and empty.
     ///
-    /// STUB POLICY (kimi: replace): naive **user-biased** merge with no aging.
-    /// It preserves FIFO per lane, loses nothing, and wakes correctly — but it
-    /// serves the WRONG lane first, so it fails the priority (P1), overtake, and
-    /// anti-starvation properties. Those are the ones to earn.
+    /// POLICY: strict control-first priority. Control is dequeued before any
+    /// waiting user (P1, overtake); users flow whenever control is idle (P3).
     pub async fn recv(&mut self) -> Option<Received<C, U>> {
-        // Silence the unused-field warning until the real policy consumes these.
         let _ = (self.aging_cap, self.consec_control);
         loop {
-            match self.urx.try_recv() {
-                Ok(u) => return Some(Received::User(u)),
-                Err(flume::TryRecvError::Disconnected) => self.usr_closed = true,
-                Err(flume::TryRecvError::Empty) => {}
-            }
             match self.crx.try_recv() {
                 Ok(c) => return Some(Received::Control(c)),
                 Err(flume::TryRecvError::Disconnected) => self.ctl_closed = true,
+                Err(flume::TryRecvError::Empty) => {}
+            }
+            match self.urx.try_recv() {
+                Ok(u) => return Some(Received::User(u)),
+                Err(flume::TryRecvError::Disconnected) => self.usr_closed = true,
                 Err(flume::TryRecvError::Empty) => {}
             }
             if self.ctl_closed && self.usr_closed {
@@ -170,13 +167,13 @@ impl<C, U> Consumer<C, U> {
             }
             tokio::select! {
                 biased;
-                u = self.urx.recv_async(), if !self.usr_closed => match u {
-                    Ok(u) => return Some(Received::User(u)),
-                    Err(_) => self.usr_closed = true,
-                },
                 c = self.crx.recv_async(), if !self.ctl_closed => match c {
                     Ok(c) => return Some(Received::Control(c)),
                     Err(_) => self.ctl_closed = true,
+                },
+                u = self.urx.recv_async(), if !self.usr_closed => match u {
+                    Ok(u) => return Some(Received::User(u)),
+                    Err(_) => self.usr_closed = true,
                 },
             }
         }
