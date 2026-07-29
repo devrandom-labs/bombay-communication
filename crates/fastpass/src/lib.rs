@@ -216,11 +216,14 @@ impl<U> UserLane<U> {
         let v = unsafe { slot.val.get().read().assume_init() };
         slot.seq.store(head.wrapping_add(self.ring.len()), Ordering::Release);
         self.head.store(head.wrapping_add(1), Ordering::Relaxed);
-        // Wake one parked producer, if any. The SeqCst load pairs with the
-        // producer's SeqCst `waiting` increment (Dekker): if this load misses
-        // the increment, the producer's post-increment re-check observes the
-        // just-freed slot, so it never parks on a non-full ring.
-        if self.waiting.load(Ordering::SeqCst) != 0 {
+        // Wake one parked producer, if any — checked every 4th pop only;
+        // a parked producer is also released by the consumer's pre-park
+        // check, so it can never sleep past an empty ring. The SeqCst load
+        // pairs with the producer's SeqCst `waiting` increment (Dekker): if
+        // this load misses the increment, the producer's post-increment
+        // re-check observes the just-freed slot, so it never parks on a
+        // non-full ring.
+        if head % 4 == 0 && self.waiting.load(Ordering::SeqCst) != 0 {
             self.send_notify.notify_one();
         }
         Some(v)
@@ -671,6 +674,13 @@ impl<C, U> Consumer<C, U> {
             if self.ctl.closed() && usr.closed() {
                 core.parked.store(false, Ordering::Relaxed);
                 continue; // loop around to the sweep-and-`None` path
+            }
+            // Release one parked producer before sleeping: with the strided
+            // in-pop `waiting` check, this is what guarantees a producer
+            // parked on a just-drained ring is always woken (its push then
+            // wakes us via `parked`).
+            if usr.waiting.load(Ordering::SeqCst) != 0 {
+                usr.send_notify.notify_one();
             }
             notified.await;
             core.parked.store(false, Ordering::Relaxed);
