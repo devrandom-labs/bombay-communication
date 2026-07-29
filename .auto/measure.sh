@@ -33,6 +33,9 @@ for d in /nix/store/*libiconv-1.*/lib; do
 	fi
 done
 
+# Optimize for the host CPU; applies uniformly to every iteration.
+export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=native"
+
 # Build, then exec the binary directly: `cargo run` measurably depresses and
 # destabilizes the workload (~2x slower, higher variance) vs a direct exec.
 if ! out_build=$(cargo build -q -p fastpass-perf --release 2>&1); then
