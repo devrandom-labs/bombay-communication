@@ -7,10 +7,10 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/fastpass",
-    "crates/fastpass-reference",
-    "crates/fastpass-testkit",
-    "crates/fastpass-perf",
+  "crates/fastpass",
+  "crates/fastpass-reference",
+  "crates/fastpass-testkit",
+  "crates/fastpass-perf",
 ]
 
 [workspace.package]

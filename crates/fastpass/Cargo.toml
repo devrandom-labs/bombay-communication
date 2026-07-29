@@ -15,7 +15,13 @@ tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 fastpass-testkit = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
+tokio = { workspace = true, features = [
+  "macros",
+  "rt",
+  "rt-multi-thread",
+  "time",
+  "sync",
+] }
 criterion = { workspace = true }
 proptest = "1.11"
 parking_lot = "0.12"
