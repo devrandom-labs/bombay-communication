@@ -10,6 +10,7 @@ members = [
     "crates/fastpass",
     "crates/fastpass-reference",
     "crates/fastpass-testkit",
+    "crates/fastpass-perf",
 ]
 
 [workspace.package]

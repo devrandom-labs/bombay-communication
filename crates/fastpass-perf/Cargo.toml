@@ -1,0 +1,21 @@
+[package]
+name = "fastpass-perf"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The perf metric harness — the number autoresearch MAXIMIZES. Frozen (Kimi must
+# not edit it): it measures `fastpass` through its public API only, so any novel
+# internal mechanism is measured on equal terms. Composite score rewards high
+# throughput AND low control-latency-under-backlog.
+[[bin]]
+name = "fastpass-perf"
+path = "src/main.rs"
+
+[dependencies]
+fastpass = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

@@ -1,17 +1,39 @@
 #!/usr/bin/env bash
-# Metric for the autoresearch loop: number of passing tests in the target crate.
-# Maximize toward all-green. A compile break parses as 0 passing, so a bad
-# experiment scores 0 and gets auto-reverted.
+# METRIC for the autoresearch loop: the composite perf SCORE (throughput divided
+# by control-latency-under-backlog). MAXIMIZE. Higher throughput and/or lower
+# control latency both raise it.
 #
-# NOTE: run UNSANDBOXED. cargo test hangs under a sandboxed shell (see the
-# kimi-delegate skill); the autoresearch loop launched from a real terminal is
-# fine. Every test carries an internal 5s timeout, so a deadlocking policy fails
-# rather than hanging the run.
+# Correctness and zero-allocation are NOT measured here — they are hard GATES in
+# .auto/checks.sh. This script only asks "how fast is the current design?". A
+# compile break makes the perf bin fail → SCORE parses as 0 → the experiment is
+# auto-reverted.
+#
+# Run UNSANDBOXED (cargo hangs under a sandboxed shell).
 set -uo pipefail
 
-out=$(cargo test -p fastpass --no-fail-fast 2>&1)
-passed=$(printf '%s\n' "$out" | grep -oE '[0-9]+ passed' | awk '{s += $1} END {print s + 0}')
-failed=$(printf '%s\n' "$out" | grep -oE '[0-9]+ failed' | awk '{s += $1} END {print s + 0}')
+# cargo may be absent from a non-interactive loop shell; fall back to the pinned
+# nix-store rust 1.96.0 (matches rust-toolchain.toml).
+if ! command -v cargo >/dev/null 2>&1; then
+	for d in /nix/store/*rust-1.96.0/bin; do
+		if [ -x "${d}/cargo" ]; then
+			PATH="${d}:${PATH}"
+			export PATH
+			break
+		fi
+	done
+fi
 
-echo "METRIC tests_passing=${passed} unit=count"
-echo "info: failed=${failed}"
+out=$(cargo run -q -p fastpass-perf --release 2>&1)
+score=$(printf '%s\n' "${out}" | grep -oE 'SCORE=[0-9.]+' | head -1 | cut -d= -f2)
+thr=$(printf '%s\n' "${out}" | grep -oE 'THROUGHPUT_OPS=[0-9.]+' | head -1 | cut -d= -f2)
+lat=$(printf '%s\n' "${out}" | grep -oE 'CONTROL_LATENCY_NS=[0-9.]+' | head -1 | cut -d= -f2)
+
+if [ -z "${score}" ]; then
+	echo "METRIC score=0 unit=composite"
+	echo "info: perf bin produced no SCORE (compile/runtime failure) — reverting"
+	printf '%s\n' "${out}" | tail -8
+	exit 0
+fi
+
+echo "METRIC score=${score} unit=composite"
+echo "info: throughput_ops=${thr} control_latency_ns=${lat}"

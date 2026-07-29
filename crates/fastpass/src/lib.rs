@@ -213,6 +213,16 @@ impl<C, U> Consumer<C, U> {
 
     /// Consume the consumer and return everything still queued on both lanes,
     /// in FIFO order (P6 teardown seam).
+    ///
+    /// # Teardown race (known limitation)
+    ///
+    /// Only *queued* items are returned. A `UserSender::send` parked on a full
+    /// lane at this moment completes `Ok` — flume pulls parked sends into the
+    /// queue on disconnect — but that item is stranded in the receiverless
+    /// queue: it appears neither here nor back at the sender. Callers needing
+    /// hard delivery guarantees across teardown must stop accepting sends
+    /// BEFORE draining (or treat a send racing `drain` as maybe-undelivered).
+    /// Pinned by `edge_cases::drain_teardown_race_discards_blocked_sender_item`.
     #[must_use]
     pub fn drain(self) -> Drained<C, U> {
         let control = self.crx.drain().collect();
