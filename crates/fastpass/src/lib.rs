@@ -147,18 +147,42 @@ impl<C, U> Consumer<C, U> {
     ///
     /// Returns `None` once both lanes are closed and empty.
     ///
-    /// POLICY: strict control-first priority. Control is dequeued before any
-    /// waiting user (P1, overtake); users flow whenever control is idle (P3).
+    /// POLICY: strict control-first priority with an anti-starvation aging
+    /// cap. Control is dequeued before any waiting user (P1, overtake); after
+    /// `aging_cap` consecutive control dequeues one waiting user is forced
+    /// through (P3 under flood). Users reset the streak; a cap of 0 disables
+    /// aging entirely.
     pub async fn recv(&mut self) -> Option<Received<C, U>> {
-        let _ = (self.aging_cap, self.consec_control);
         loop {
+            // Aging safety net: the streak reached the cap and a user is
+            // waiting — serve it before any more control.
+            if self.aging_cap != 0 && self.consec_control >= self.aging_cap {
+                match self.urx.try_recv() {
+                    Ok(u) => {
+                        self.consec_control = 0;
+                        return Some(Received::User(u));
+                    }
+                    Err(flume::TryRecvError::Disconnected) => self.usr_closed = true,
+                    Err(flume::TryRecvError::Empty) => {}
+                }
+            }
             match self.crx.try_recv() {
-                Ok(c) => return Some(Received::Control(c)),
+                Ok(c) => {
+                    // Guarded increment: streak never exceeds the cap, so it
+                    // cannot overflow.
+                    if self.aging_cap != 0 && self.consec_control < self.aging_cap {
+                        self.consec_control += 1;
+                    }
+                    return Some(Received::Control(c));
+                }
                 Err(flume::TryRecvError::Disconnected) => self.ctl_closed = true,
                 Err(flume::TryRecvError::Empty) => {}
             }
             match self.urx.try_recv() {
-                Ok(u) => return Some(Received::User(u)),
+                Ok(u) => {
+                    self.consec_control = 0;
+                    return Some(Received::User(u));
+                }
                 Err(flume::TryRecvError::Disconnected) => self.usr_closed = true,
                 Err(flume::TryRecvError::Empty) => {}
             }
@@ -168,11 +192,19 @@ impl<C, U> Consumer<C, U> {
             tokio::select! {
                 biased;
                 c = self.crx.recv_async(), if !self.ctl_closed => match c {
-                    Ok(c) => return Some(Received::Control(c)),
+                    Ok(c) => {
+                        if self.aging_cap != 0 && self.consec_control < self.aging_cap {
+                            self.consec_control += 1;
+                        }
+                        return Some(Received::Control(c));
+                    }
                     Err(_) => self.ctl_closed = true,
                 },
                 u = self.urx.recv_async(), if !self.usr_closed => match u {
-                    Ok(u) => return Some(Received::User(u)),
+                    Ok(u) => {
+                        self.consec_control = 0;
+                        return Some(Received::User(u));
+                    }
                     Err(_) => self.usr_closed = true,
                 },
             }
