@@ -27,13 +27,11 @@
 //! The public API below is FIXED — the property suite in `fastpass-testkit`
 //! depends on these exact names and signatures.
 
-use std::collections::VecDeque;
 use std::fmt;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
-use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 /// Consumer configuration.
@@ -251,37 +249,132 @@ impl<U> Drop for UserLane<U> {
     }
 }
 
-/// The unbounded control sideband: control never shares the user ring, so a
-/// full ring can never delay it.
+/// Slots per control block. Blocks are single-use (never reused), so a slot
+/// needs no Vyukov ticket — just a publish flag.
+const CBLOCK: usize = 64;
+
+/// One control slot: written once, published with `ready`.
+struct CSlot<C> {
+    ready: AtomicBool,
+    val: std::cell::UnsafeCell<MaybeUninit<C>>,
+}
+
+/// A linked block of the control queue.
+struct CBlock<C> {
+    /// Global block index (`block_base = idx * CBLOCK`).
+    idx: usize,
+    slots: [CSlot<C>; CBLOCK],
+    next: AtomicPtr<CBlock<C>>,
+}
+
+impl<C> CBlock<C> {
+    fn new(idx: usize) -> Box<Self> {
+        Box::new(Self {
+            idx,
+            slots: std::array::from_fn(|_| CSlot {
+                ready: AtomicBool::new(false),
+                val: std::cell::UnsafeCell::new(MaybeUninit::uninit()),
+            }),
+            next: AtomicPtr::new(std::ptr::null_mut()),
+        })
+    }
+}
+
+/// The unbounded control sideband: a lock-free MPSC chain of single-use
+/// blocks. Producers claim a global ticket with one `fetch_add` and publish
+/// into their slot; the single consumer pops in ticket order lock-free.
+/// Control never shares the user ring, so a full ring can never delay it.
 struct ControlLane<C> {
-    queue: Mutex<VecDeque<C>>,
+    /// Next claim ticket (multi-producer `fetch_add`; unbounded).
+    tail: AtomicUsize,
+    /// Highest linked block (best-effort hint; producers walk forward from it).
+    tail_block: AtomicPtr<CBlock<C>>,
+    /// Anchor of the block chain (block 0); freed wholesale at lane drop.
+    first_block: *mut CBlock<C>,
+    /// Tickets consumed, published by the consumer ONLY at teardown so the
+    /// lane's `Drop` reclaims exactly the published-but-unconsumed items.
+    consumed: AtomicUsize,
     /// Live [`ControlSender`] handles; lane is closed when this reaches 0.
     senders: AtomicUsize,
     core: Arc<Core>,
 }
 
+// SAFETY: a slot's value is written before `ready` is set (Release) and read
+// only after observing `ready` (Acquire); each ticket is claimed by exactly
+// one producer; blocks are linked before any of their slots are published
+// and freed only when all senders and the consumer are gone. `C` crosses
+// threads only through that protocol, so `C: Send` suffices.
+unsafe impl<C: Send> Send for ControlLane<C> {}
+unsafe impl<C: Send> Sync for ControlLane<C> {}
+
 impl<C> ControlLane<C> {
-    /// Serve from the stash; refill it under one lock acquisition when empty.
-    /// A lone queued control is popped in place (no swap) — that is the
-    /// latency-critical path; the O(1) whole-queue swap is reserved for
-    /// bursts, where it amortizes the lock over every stashed item.
-    #[inline]
-    fn pop_stashed(&self, stash: &mut VecDeque<C>) -> Option<C> {
-        if !stash.is_empty() {
-            return stash.pop_front();
+    /// Claim the next ticket and publish `item` into its slot.
+    fn push(&self, item: C) {
+        let pos = self.tail.fetch_add(1, Ordering::AcqRel);
+        let want = pos / CBLOCK;
+        let mut b = self.tail_block.load(Ordering::Acquire);
+        // Advance the block chain to the block containing `pos`, linking
+        // fresh blocks as needed. Racing linkers: exactly one CAS wins per
+        // `next` pointer; losers free their spare block.
+        while unsafe { &*b }.idx < want {
+            let next = unsafe { &*b }.next.load(Ordering::Acquire);
+            if next.is_null() {
+                let fresh = Box::into_raw(CBlock::new(unsafe { &*b }.idx + 1));
+                match unsafe { &*b }.next.compare_exchange(
+                    std::ptr::null_mut(),
+                    fresh,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        let _ = self.tail_block.compare_exchange(
+                            b,
+                            fresh,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        );
+                    }
+                    Err(_) => drop(unsafe { Box::from_raw(fresh) }),
+                }
+                continue;
+            }
+            let _ = self
+                .tail_block
+                .compare_exchange(b, next, Ordering::Release, Ordering::Relaxed);
+            b = next;
         }
-        let mut q = self.queue.lock();
-        if q.len() <= 1 {
-            return q.pop_front();
-        }
-        std::mem::swap(&mut *q, stash);
-        drop(q);
-        stash.pop_front()
+        // SAFETY: `b` is the block containing `pos`; the ticket is unique to
+        // this push, so we hold exclusive access to the slot.
+        let slot = unsafe { &(*b).slots[pos % CBLOCK] };
+        unsafe { slot.val.get().write(MaybeUninit::new(item)) };
+        slot.ready.store(true, Ordering::Release);
     }
 
     #[inline]
     fn closed(&self) -> bool {
         self.senders.load(Ordering::Acquire) == 0
+    }
+}
+
+impl<C> Drop for ControlLane<C> {
+    fn drop(&mut self) {
+        // Quiescent: all senders and the consumer are gone. Reclaim every
+        // published-but-unconsumed slot, then free the whole chain.
+        let consumed = *self.consumed.get_mut();
+        let tail = *self.tail.get_mut();
+        let mut b = self.first_block;
+        while !b.is_null() {
+            let mut block = unsafe { Box::from_raw(b) };
+            let base = block.idx * CBLOCK;
+            for pos in base.max(consumed)..(base + CBLOCK).min(tail) {
+                let slot = &block.slots[pos % CBLOCK];
+                if slot.ready.load(Ordering::Relaxed) {
+                    // SAFETY: published and never consumed; exclusive ownership.
+                    unsafe { slot.val.get().drop_in_place() };
+                }
+            }
+            b = *block.next.get_mut();
+        }
     }
 }
 
@@ -316,7 +409,7 @@ impl<C> ControlSender<C> {
         if self.lane.core.consumer_gone.load(Ordering::Acquire) {
             return Err(ControlClosed(item));
         }
-        self.lane.queue.lock().push_back(item);
+        self.lane.push(item);
         self.lane.core.wake_consumer();
         Ok(())
     }
@@ -420,11 +513,48 @@ pub struct Consumer<C, U> {
     /// Consecutive control dequeues since the last user dequeue (the aging
     /// streak; never exceeds `aging_cap`).
     consec_control: usize,
-    /// Controls moved out of the sideband under one lock, served first.
-    ctl_stash: VecDeque<C>,
+    /// Consumer-side control pop ticket (plain counter, no atomic).
+    ctl_head: usize,
+    /// Block containing `ctl_head`; consumer-only, never freed under it
+    /// (the chain is reclaimed wholesale at lane drop).
+    ctl_block: *mut CBlock<C>,
 }
 
+// SAFETY: `ctl_block` is dereferenced only by the consumer that owns it, and
+// the pointee outlives the consumer (freed in `ControlLane::drop`, and the
+// consumer holds an `Arc<ControlLane<C>>`).
+unsafe impl<C: Send, U: Send> Send for Consumer<C, U> {}
+
 impl<C, U> Consumer<C, U> {
+    /// Pop the next published control in ticket order. Consumer-only.
+    #[inline]
+    fn pop_control(&mut self) -> Option<C> {
+        let mut block = self.ctl_block;
+        // SAFETY: `ctl_block` is always a live block (chain freed only at
+        // lane drop; the consumer holds an Arc on the lane).
+        let b = unsafe { &*block };
+        if self.ctl_head == (b.idx + 1) * CBLOCK {
+            // Crossed a block boundary: the next block is linked before any
+            // of its slots are published, so `null` means the lane is empty.
+            let next = b.next.load(Ordering::Acquire);
+            if next.is_null() {
+                return None;
+            }
+            self.ctl_block = next;
+            block = next;
+        }
+        // SAFETY: as above; `ctl_head % CBLOCK` is in bounds.
+        let slot = unsafe { &(*block).slots[self.ctl_head % CBLOCK] };
+        if !slot.ready.load(Ordering::Acquire) {
+            return None;
+        }
+        // SAFETY: `ready` (Acquire) orders the producer's write before this
+        // read; only the consumer pops, and each slot is published once.
+        let v = unsafe { slot.val.get().read().assume_init() };
+        self.ctl_head = self.ctl_head.wrapping_add(1);
+        Some(v)
+    }
+
     /// Receive the next item.
     ///
     /// Returns `None` once both lanes are closed and empty.
@@ -435,13 +565,44 @@ impl<C, U> Consumer<C, U> {
     /// through (P3 under flood). Users reset the streak; a cap of 0 disables
     /// aging entirely.
     pub async fn recv(&mut self) -> Option<Received<C, U>> {
-        // Split borrows: lanes + stash + streak are disjoint fields.
-        let ctl = &self.ctl;
+        // Split borrows: lanes + streak + control cursor are disjoint fields.
         let usr = &self.usr;
         let core = &self.core;
         let aging_cap = self.aging_cap;
         let streak = &mut self.consec_control;
-        let stash = &mut self.ctl_stash;
+
+        macro_rules! pop_control {
+            () => {{
+                let mut block = self.ctl_block;
+                let b = unsafe { &*block };
+                if self.ctl_head == (b.idx + 1) * CBLOCK {
+                    let next = b.next.load(Ordering::Acquire);
+                    if next.is_null() {
+                        None
+                    } else {
+                        self.ctl_block = next;
+                        block = next;
+                        let slot = unsafe { &(*block).slots[self.ctl_head % CBLOCK] };
+                        if slot.ready.load(Ordering::Acquire) {
+                            let v = unsafe { slot.val.get().read().assume_init() };
+                            self.ctl_head = self.ctl_head.wrapping_add(1);
+                            Some(v)
+                        } else {
+                            None
+                        }
+                    }
+                } else {
+                    let slot = unsafe { &(*block).slots[self.ctl_head % CBLOCK] };
+                    if slot.ready.load(Ordering::Acquire) {
+                        let v = unsafe { slot.val.get().read().assume_init() };
+                        self.ctl_head = self.ctl_head.wrapping_add(1);
+                        Some(v)
+                    } else {
+                        None
+                    }
+                }
+            }};
+        }
 
         macro_rules! take_control {
             ($c:expr) => {{
@@ -468,20 +629,20 @@ impl<C, U> Consumer<C, U> {
                     take_user!(u);
                 }
             }
-            if let Some(c) = ctl.pop_stashed(stash) {
+            if let Some(c) = pop_control!() {
                 take_control!(c);
             }
             if let Some(u) = usr.pop() {
                 take_user!(u);
             }
 
-            let ctl_closed = ctl.closed();
+            let ctl_closed = self.ctl.closed();
             let usr_closed = usr.closed();
             if ctl_closed && usr_closed {
                 // Both lanes closed: no item can arrive anymore. Final sweep
                 // ordered after the Acquire loads above, so any item a
                 // departing sender pushed is visible here.
-                if let Some(c) = ctl.pop_stashed(stash) {
+                if let Some(c) = pop_control!() {
                     take_control!(c);
                 }
                 if let Some(u) = usr.pop() {
@@ -499,7 +660,7 @@ impl<C, U> Consumer<C, U> {
             notified.as_mut().enable();
             core.parked.store(true, Ordering::SeqCst);
 
-            if let Some(c) = ctl.pop_stashed(stash) {
+            if let Some(c) = pop_control!() {
                 core.parked.store(false, Ordering::Relaxed);
                 take_control!(c);
             }
@@ -507,7 +668,7 @@ impl<C, U> Consumer<C, U> {
                 core.parked.store(false, Ordering::Relaxed);
                 take_user!(u);
             }
-            if ctl.closed() && usr.closed() {
+            if self.ctl.closed() && usr.closed() {
                 core.parked.store(false, Ordering::Relaxed);
                 continue; // loop around to the sweep-and-`None` path
             }
@@ -531,8 +692,10 @@ impl<C, U> Consumer<C, U> {
     #[must_use]
     pub fn drain(mut self) -> Drained<C, U> {
         self.teardown();
-        let mut control: Vec<C> = self.ctl_stash.drain(..).collect();
-        control.extend(self.ctl.queue.lock().drain(..));
+        let mut control: Vec<C> = Vec::new();
+        while let Some(c) = self.pop_control() {
+            control.push(c);
+        }
         let mut user = Vec::new();
         let mut head = self.usr.head.load(Ordering::Relaxed);
         let tail = self.usr.tail.load(Ordering::Acquire);
@@ -548,13 +711,18 @@ impl<C, U> Consumer<C, U> {
             head = head.wrapping_add(1);
         }
         self.usr.head.store(head, Ordering::Relaxed);
+        // Republish the consumed ticket past everything collected above, so
+        // the lane's `Drop` does not reclaim items we just moved out.
+        self.ctl.consumed.store(self.ctl_head, Ordering::Release);
         Drained { control, user }
     }
 
-    /// Idempotent teardown: flag the consumer gone, then release parked user
-    /// senders (their pending park resolves to `Ok`, item discarded) and wake
-    /// any parked `recv`.
+    /// Idempotent teardown: flag the consumer gone, publish the consumed
+    /// control ticket so the lane's `Drop` reclaims exactly the unconsumed
+    /// tail, then release parked user senders (their pending park resolves
+    /// to `Ok`, item discarded) and wake any parked `recv`.
     fn teardown(&self) {
+        self.ctl.consumed.store(self.ctl_head, Ordering::Release);
         if self.core.consumer_gone.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -594,8 +762,12 @@ pub fn channel<C, U>(cfg: Config) -> (ControlSender<C>, UserSender<U>, Consumer<
         parked: AtomicBool::new(false),
         consumer_gone: AtomicBool::new(false),
     });
+    let first_block = Box::into_raw(CBlock::new(0));
     let ctl = Arc::new(ControlLane {
-        queue: Mutex::new(VecDeque::new()),
+        tail: AtomicUsize::new(0),
+        tail_block: AtomicPtr::new(first_block),
+        first_block,
+        consumed: AtomicUsize::new(0),
         senders: AtomicUsize::new(1),
         core: core.clone(),
     });
@@ -617,7 +789,8 @@ pub fn channel<C, U>(cfg: Config) -> (ControlSender<C>, UserSender<U>, Consumer<
             core,
             aging_cap: cfg.aging_cap,
             consec_control: 0,
-            ctl_stash: VecDeque::new(),
+            ctl_head: 0,
+            ctl_block: first_block,
         },
     )
 }
