@@ -35,11 +35,19 @@ for d in /nix/store/*libiconv-1.*/lib; do
 done
 
 base=$(cat .auto/BASELINE 2>/dev/null || true)
+# Frozen surfaces: the oracle, the reference, the perf harness, and the
+# conformance/alloc/leak test files (which also pin the public API — the plug
+# seam). NOT frozen: crates/fastpass/src/**, crates/fastpass/Cargo.toml (deps),
+# and crates/fastpass/tests/loom.rs — Kimi must be free to add the loom lane.
 FROZEN=(
 	crates/fastpass-testkit
 	crates/fastpass-reference
 	crates/fastpass-perf
-	crates/fastpass/tests
+	crates/fastpass/tests/property_suite.rs
+	crates/fastpass/tests/edge_cases.rs
+	crates/fastpass/tests/proptest_interleavings.rs
+	crates/fastpass/tests/alloc.rs
+	crates/fastpass/tests/leak.rs
 )
 if [ -n "${base}" ]; then
 	if ! git diff --quiet "${base}" -- "${FROZEN[@]}"; then
@@ -48,9 +56,20 @@ if [ -n "${base}" ]; then
 	fi
 fi
 
-# Conformance + zero-alloc must stay green. --tests skips the ADR benches.
+# Gate 2 — conformance + zero-alloc + no-leak (P1–P8). --tests skips ADR benches.
 if ! cargo test -p fastpass --tests --no-fail-fast >/dev/null 2>&1; then
-	echo "CHECK FAIL: conformance suite (or zero-alloc guard) is not green"
+	echo "CHECK FAIL: conformance / zero-alloc / leak suite is not green"
+	exit 1
+fi
+
+# Gate 3 — wakeup soundness: the atomic protocol must pass a loom model-check.
+# Kimi provides crates/fastpass/tests/loom.rs: a cfg(loom) atomic swap plus a
+# SYNC 2-producer/1-consumer harness over the real wakeup/backpressure protocol
+# (tokio Notify stays on the non-loom async path). Absent or failing => revert.
+# Bounded preemptions keep the exploration tractable per iteration.
+if ! LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS="--cfg loom" \
+	cargo test -p fastpass --test loom --release >/dev/null 2>&1; then
+	echo "CHECK FAIL: loom model-check of the wakeup protocol is absent or failing (crates/fastpass/tests/loom.rs)"
 	exit 1
 fi
 
