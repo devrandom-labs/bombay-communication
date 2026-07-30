@@ -625,6 +625,13 @@ impl<C> ControlLane<C> {
         if cfg!(loom) {
             return;
         }
+        // Amortize: reclaim every 4th block crossing — the retired prefix
+        // stays bounded by a few blocks (and is reclaimed wholesale at lane
+        // drop), while the drain hot path pays the check once per 4
+        // crossings instead of every crossing.
+        if unsafe { &*cursor }.idx % 4 != 0 {
+            return;
+        }
         let tb = self.tail_block.load(Ordering::SeqCst);
         // SAFETY: `tb` and `cursor` are live blocks (reclamation only ever
         // frees strictly behind both).
