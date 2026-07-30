@@ -629,7 +629,7 @@ impl<C> ControlLane<C> {
         // stays bounded by a few blocks (and is reclaimed wholesale at lane
         // drop), while the drain hot path pays the check once per 4
         // crossings instead of every crossing.
-        if unsafe { &*cursor }.idx % 4 != 0 {
+        if unsafe { &*cursor }.idx % 8 != 0 {
             return;
         }
         let tb = self.tail_block.load(Ordering::SeqCst);
