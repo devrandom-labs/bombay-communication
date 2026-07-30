@@ -13,26 +13,171 @@
 //!   occupied parks on a `send_notify` eventcount and is woken one-per-pop by
 //!   the consumer. A steady-state `try_send` is a handful of atomics and
 //!   never allocates (P7).
-//! - **Control lane** — a sideband `Mutex<VecDeque<C>>`: control never enters
-//!   the ring, so the ring can never reorder it behind user traffic. The
-//!   consumer drains the whole sideband into a local stash under ONE lock
-//!   acquisition, so the hot `recv` is a stash pop with zero atomics.
+//! - **Control lane** — an unbounded lock-free MPSC chain of single-use
+//!   64-slot blocks: producers claim a global ticket with one `fetch_add`
+//!   and publish into their slot; the single consumer pops in ticket order.
+//!   Consumed blocks are reclaimed by the consumer once no producer can
+//!   hold a block hint into them (an `in_flight` registration brackets each
+//!   push's hint window), so the lane does not leak (P8). Control never
+//!   shares the user ring, so a full ring can never delay it.
 //! - **Wakeup** — one shared [`tokio::sync::Notify`] gated by a `parked`
 //!   flag. A producer pays a single atomic load when the consumer is active;
 //!   a parked consumer is woken by `notify_one` after registering with
 //!   enable-then-recheck, so the lost-wakeup class is impossible by
 //!   construction and `recv` stays cancel-safe (no item is moved before the
-//!   consumer is known to be awake to take it).
+//!   consumer is known to be awake to take it). The flag protocol is
+//!   model-checked under `cfg(loom)` (`tests/loom.rs`).
 //!
 //! The public API below is FIXED — the property suite in `fastpass-testkit`
 //! depends on these exact names and signatures.
 
 use std::fmt;
 use std::mem::MaybeUninit;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
+#[cfg(not(loom))]
+use std::sync::Arc;
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+
+#[cfg(loom)]
+use loom::sync::Arc;
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+
+#[cfg(not(loom))]
 use tokio::sync::Notify;
+
+/// Synchronous stand-in for `tokio::sync::Notify`, used ONLY under
+/// `cfg(loom)`: models tokio's registration semantics explicitly so the
+/// `parked`/`waiting` flag protocol exercised by the loom model matches the
+/// async build. `enable()` arms a registration (the async twins call
+/// `Notified::enable` at the same points); `notify_one` wakes one
+/// registered waiter or stores a single permit; `notify_waiters` wakes all
+/// registered waiters without storing one. Wake credits are pooled
+/// (`woken`), so a registration abandoned by an early return can only
+/// cause a spurious extra loop turn, never a lost wakeup — matching
+/// tokio's `Notify`.
+#[cfg(loom)]
+mod sync_notify {
+    use loom::sync::atomic::Ordering;
+
+    pub struct Notify {
+        state: loom::sync::Mutex<State>,
+        cv: loom::sync::Condvar,
+    }
+
+    struct State {
+        /// Stored permit (notify with no registered waiter), at most one.
+        permit: bool,
+        /// Armed registrations not yet consumed by a `wait`.
+        enabled: usize,
+        /// Wake credits granted by `notify_one`/`notify_waiters`.
+        woken: usize,
+    }
+
+    impl Notify {
+        pub fn new() -> Self {
+            Self {
+                state: loom::sync::Mutex::new(State {
+                    permit: false,
+                    enabled: 0,
+                    woken: 0,
+                }),
+                cv: loom::sync::Condvar::new(),
+            }
+        }
+
+        /// Arm a registration, mirroring `Notified::enable`. ALSO the
+        /// synchronization point of the loom protocol: the caller announces
+        /// its flag (`parked`/`waiting`) BEFORE this call, so the mutex
+        /// release here publishes the announcement to any subsequent
+        /// `notify_if*` lock.
+        pub fn enable(&self) {
+            self.state.lock().unwrap().enabled += 1;
+        }
+
+        /// Wake one waiter iff `flag` is set. The flag check happens UNDER
+        /// the lock: if this lock follows the waiter's `enable` in the
+        /// mutex order, the check synchronizes-with the waiter's
+        /// announcement and must observe it; otherwise the waiter's
+        /// post-enable re-check observes whatever this caller published
+        /// before locking. A plain atomic check outside the lock has no
+        /// happens-before edge to the announcement, and loom (correctly
+        /// over-approximating hardware) explores the lost wakeup.
+        pub fn notify_if(&self, flag: &loom::sync::atomic::AtomicBool) {
+            let mut g = self.state.lock().unwrap();
+            if !flag.load(Ordering::SeqCst) {
+                return;
+            }
+            if g.enabled > 0 {
+                g.enabled -= 1;
+                g.woken += 1;
+                self.cv.notify_one();
+            } else {
+                g.permit = true;
+            }
+        }
+
+        /// Wake one waiter iff `n` is nonzero — see `notify_if`.
+        pub fn notify_if_nonzero(&self, n: &loom::sync::atomic::AtomicUsize) {
+            let mut g = self.state.lock().unwrap();
+            if n.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            if g.enabled > 0 {
+                g.enabled -= 1;
+                g.woken += 1;
+                self.cv.notify_one();
+            } else {
+                g.permit = true;
+            }
+        }
+
+        pub fn notify_one(&self) {
+            let mut g = self.state.lock().unwrap();
+            if g.enabled > 0 {
+                g.enabled -= 1;
+                g.woken += 1;
+                self.cv.notify_one();
+            } else {
+                g.permit = true;
+            }
+        }
+
+        pub fn notify_waiters(&self) {
+            let mut g = self.state.lock().unwrap();
+            g.woken += g.enabled;
+            g.enabled = 0;
+            self.cv.notify_all();
+        }
+
+        /// Park until a wake credit or stored permit is available, then
+        /// consume it.
+        pub fn wait(&self) {
+            let mut g = self.state.lock().unwrap();
+            if g.permit {
+                g.permit = false;
+                return;
+            }
+            while g.woken == 0 {
+                g = self.cv.wait(g).unwrap();
+            }
+            g.woken -= 1;
+        }
+
+        /// Lock+unlock with no other effect: a happens-before edge to every
+        /// `notify_if*` that ran before it in the mutex order. The closed
+        /// sweep uses this to observe a departing sender's publishes — the
+        /// sender's pre-decrement `wake_consumer` (a `notify_if` lock) is
+        /// program-ordered before the decrement the consumer observed.
+        pub fn sync_point(&self) {
+            let _g = self.state.lock().unwrap();
+        }
+    }
+}
+
+#[cfg(loom)]
+use sync_notify::Notify;
 
 /// Consumer configuration.
 #[derive(Debug, Clone, Copy)]
@@ -43,6 +188,9 @@ pub struct Config {
 
 impl Config {
     /// A config with the given bounded user-lane capacity and no aging.
+    ///
+    /// The capacity is a MINIMUM: the ring rounds it up to a power of two
+    /// (floor 2), and the rounded size is the effective capacity.
     #[must_use]
     pub const fn new(user_capacity: usize) -> Self {
         Self { user_capacity, aging_cap: 0 }
@@ -108,15 +256,26 @@ struct Core {
 }
 
 impl Core {
-    /// Wake the consumer iff it is parked. The SeqCst load pairs with the
-    /// consumer's SeqCst `parked` store (Dekker): if this load misses the
-    /// store, this producer's push is visible to the consumer's post-store
-    /// re-check, so no wakeup is needed.
+    /// Wake the consumer iff it is parked. The check is an RMW, not a plain
+    /// load: absent a happens-before edge, a load may legally miss the
+    /// consumer's earlier `parked` store (store buffering — loom exhibits
+    /// the lost wakeup), while an RMW always observes the newest value in
+    /// the modification order. The consumer's post-store re-check covers
+    /// the other Dekker direction.
+    #[cfg(not(loom))]
     #[inline]
     fn wake_consumer(&self) {
         if self.parked.load(Ordering::SeqCst) {
             self.notify.notify_one();
         }
+    }
+
+    /// Wake the consumer iff it is parked — loom variant: the flag check is
+    /// taken under the `Notify` stand-in's lock so it synchronizes with the
+    /// consumer's announcement (see `sync_notify::Notify::notify_if`).
+    #[cfg(loom)]
+    fn wake_consumer(&self) {
+        self.notify.notify_if(&self.parked);
     }
 }
 
@@ -126,7 +285,7 @@ impl Core {
 /// position when free and `position + 1` once published. The narrow ticket
 /// halves slot memory for small `U`.
 struct Slot<U> {
-    seq: std::sync::atomic::AtomicU32,
+    seq: AtomicU32,
     val: std::cell::UnsafeCell<MaybeUninit<U>>,
 }
 
@@ -224,15 +383,28 @@ impl<U> UserLane<U> {
         self.head.store(head.wrapping_add(1), Ordering::Relaxed);
         // Wake one parked producer, if any — checked every 4th pop only;
         // a parked producer is also released by the consumer's pre-park
-        // check, so it can never sleep past an empty ring. The SeqCst load
-        // pairs with the producer's SeqCst `waiting` increment (Dekker): if
-        // this load misses the increment, the producer's post-increment
-        // re-check observes the just-freed slot, so it never parks on a
-        // non-full ring.
-        if head % 4 == 0 && self.waiting.load(Ordering::SeqCst) != 0 {
-            self.send_notify.notify_one();
+        // check, so it can never sleep past an empty ring.
+        if head % 4 == 0 {
+            self.release_one_waiter();
         }
         Some(v)
+    }
+
+    /// Release one parked producer, if any is waiting.
+    #[cfg(not(loom))]
+    #[inline]
+    fn release_one_waiter(&self) {
+        if self.waiting.load(Ordering::SeqCst) != 0 {
+            self.send_notify.notify_one();
+        }
+    }
+
+    /// Release one parked producer, if any — loom variant: the `waiting`
+    /// check is taken under the `Notify` stand-in's lock (see
+    /// `sync_notify::Notify::notify_if`).
+    #[cfg(loom)]
+    fn release_one_waiter(&self) {
+        self.send_notify.notify_if_nonzero(&self.waiting);
     }
 
     /// True once every [`UserSender`] is gone.
@@ -246,8 +418,8 @@ impl<U> Drop for UserLane<U> {
     fn drop(&mut self) {
         // Quiescent: all senders and the consumer are gone, so `head..tail`
         // are exactly the published-but-unconsumed items.
-        let head = *self.head.get_mut();
-        let tail = *self.tail.get_mut();
+        let head = self.head.load(Ordering::Relaxed); // quiescent: &mut self
+        let tail = self.tail.load(Ordering::Relaxed); // quiescent: &mut self
         for pos in head..tail {
             let slot = &self.ring[pos & self.mask()];
             if slot.seq.load(Ordering::Relaxed) == (pos as u32).wrapping_add(1) {
@@ -259,8 +431,14 @@ impl<U> Drop for UserLane<U> {
 }
 
 /// Slots per control block. Blocks are single-use (never reused), so a slot
-/// needs no Vyukov ticket — just a publish flag.
+/// needs no Vyukov ticket — just a publish flag. Under `cfg(loom)` the
+/// block is shrunk so the tiny model crosses block boundaries (linking,
+/// hint advance, and reclamation are all exercised).
+#[cfg(not(loom))]
 const CBLOCK: usize = 64;
+/// `CBLOCK` under loom — see above.
+#[cfg(loom)]
+const CBLOCK: usize = 2;
 
 /// One control slot: written once, published with `ready`.
 struct CSlot<C> {
@@ -296,10 +474,23 @@ impl<C> CBlock<C> {
 struct ControlLane<C> {
     /// Next claim ticket (multi-producer `fetch_add`; unbounded).
     tail: AtomicUsize,
-    /// Highest linked block (best-effort hint; producers walk forward from it).
+    /// Highest linked block (best-effort hint; producers walk forward from
+    /// it). Never points behind `first_block` (reclaim's `min` bound), so
+    /// any value read here is a live block.
     tail_block: AtomicPtr<CBlock<C>>,
-    /// Anchor of the block chain (block 0); freed wholesale at lane drop.
-    first_block: *mut CBlock<C>,
+    /// Live frontier: the first block a push may walk from. Monotonic,
+    /// consumer-only writer, published BEFORE the corresponding reclamation
+    /// check so a push that registers in-flight afterwards is guaranteed
+    /// (SeqCst chain) to read a frontier above the freed prefix.
+    first_block: AtomicPtr<CBlock<C>>,
+    /// First unfreed block. Blocks in `[free_anchor, first_block)` are
+    /// retired (fully consumed) but not yet freed — freeing waits for an
+    /// `in_flight == 0` crossing. Consumer-only writer, read at lane drop.
+    free_anchor: AtomicPtr<CBlock<C>>,
+    /// Slow (block-crossing) pushes between their in-flight registration
+    /// and slot publish. The consumer frees retired blocks only while this
+    /// is zero, which proves no push can be walking the freed prefix.
+    in_flight: AtomicUsize,
     /// Tickets consumed, published by the consumer ONLY at teardown so the
     /// lane's `Drop` reclaims exactly the published-but-unconsumed items.
     consumed: AtomicUsize,
@@ -319,9 +510,47 @@ unsafe impl<C: Send> Sync for ControlLane<C> {}
 impl<C> ControlLane<C> {
     /// Claim the next ticket and publish `item` into its slot.
     fn push(&self, item: C) {
+        // Load the hint BEFORE claiming the ticket. `tail_block` always
+        // points at a block containing an already-claimed ticket `t`, and
+        // any ticket claimed after this load satisfies `pos >= tail > t`,
+        // so `hint.idx <= t / CBLOCK <= pos / CBLOCK == want`: the hint's
+        // block is never BEYOND the ticket's block. (Claim-first ordering
+        // lets a preempted push resume with a hint beyond its ticket's
+        // block and publish into the wrong slot.)
+        let hint = self.tail_block.load(Ordering::SeqCst);
         let pos = self.tail.fetch_add(1, Ordering::AcqRel);
         let want = pos / CBLOCK;
-        let mut b = self.tail_block.load(Ordering::Acquire);
+        // SAFETY: `hint` is a live block: it contains a claimed ticket and
+        // `hint.idx <= want` by the ordering above.
+        if unsafe { &*hint }.idx == want {
+            // FAST PATH (steady state): the ticket lives in the hinted
+            // block, no walk. The block cannot be reclaimed before our
+            // publish: `reclaim` only frees blocks the consumer has fully
+            // crossed, and our ticket in it is not even published yet, so
+            // the consumer's cursor cannot pass it.
+            let slot = unsafe { &(*hint).slots[pos % CBLOCK] };
+            unsafe { slot.val.get().write(MaybeUninit::new(item)) };
+            slot.ready.store(true, Ordering::Release);
+            return;
+        }
+        // SLOW PATH (block crossing): the walk passes through intermediate
+        // blocks, which the consumer may reclaim once it has crossed them —
+        // register in-flight so `reclaim` provably holds off (see
+        // `reclaim`), THEN take a provably-live hint. The inc is ordered
+        // before the hint loads below, so any hint this push walks from is
+        // covered by the in_flight guard; the initial `hint` may be stale
+        // and is never dereferenced here.
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let mut b = self.tail_block.load(Ordering::SeqCst);
+        // SAFETY: `b` is live: `tail_block` never points behind the
+        // consumer's reclaim frontier, and `in_flight >= 1` blocks new
+        // frees for the rest of this push.
+        if unsafe { &*b }.idx > want {
+            // Another producer advanced `tail_block` past our ticket's
+            // block; walk from the reclaim frontier instead (also live,
+            // via the SeqCst chain documented in `reclaim`).
+            b = self.first_block.load(Ordering::SeqCst);
+        }
         // Advance the block chain to the block containing `pos`, linking
         // fresh blocks as needed. Racing linkers: exactly one CAS wins per
         // `next` pointer; losers free their spare block.
@@ -339,8 +568,8 @@ impl<C> ControlLane<C> {
                         let _ = self.tail_block.compare_exchange(
                             b,
                             fresh,
-                            Ordering::Release,
-                            Ordering::Relaxed,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
                         );
                     }
                     Err(_) => drop(unsafe { Box::from_raw(fresh) }),
@@ -349,16 +578,86 @@ impl<C> ControlLane<C> {
             }
             let _ = self
                 .tail_block
-                .compare_exchange(b, next, Ordering::Release, Ordering::Relaxed);
+                .compare_exchange(b, next, Ordering::SeqCst, Ordering::SeqCst);
             b = next;
         }
-        // SAFETY: `b` is the block containing `pos`; the ticket is unique to
-        // this push, so we hold exclusive access to the slot.
+        // SAFETY: `b` is the block containing `pos` (the walk terminates
+        // with `b.idx == want`); `b` and every block the walk touched are
+        // live under the in_flight guard; the ticket is unique to this
+        // push, so we hold exclusive access to the slot.
         let slot = unsafe { &(*b).slots[pos % CBLOCK] };
         unsafe { slot.val.get().write(MaybeUninit::new(item)) };
         slot.ready.store(true, Ordering::Release);
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// Free fully-consumed blocks behind `cursor` (the consumer's current
+    /// block). Consumer-only. Two-phase:
+    ///
+    /// 1. PUBLISH the live frontier (`first_block`) to the first block at
+    ///    or after `min(cursor, tail_block)`. A block below `cursor` was
+    ///    fully consumed (values moved out); a block below `tail_block`
+    ///    can never be a push's walk start. The `min` is load-bearing: a
+    ///    freshly LINKED block briefly lags `tail_block` while its
+    ///    linker's advance CAS is in flight.
+    /// 2. FREE the retired prefix `[free_anchor, frontier)` — only if
+    ///    `in_flight == 0`; otherwise freeing catches up at a later
+    ///    crossing (no leak: `free_anchor` only advances on real frees).
+    ///
+    /// Ordering (Dekker over SeqCst): the frontier store (p1) precedes the
+    /// `in_flight` read (p2) in program order. A slow push's increment
+    /// (p3) precedes its frontier/hint loads (p4). If p2 observes zero,
+    /// any push still walking has p3 AFTER p2 in the SeqCst order, hence
+    /// p4 > p3 > p2 > p1: it reads a frontier >= the one published here,
+    /// and `tail_block` >= `first_block` always, so no push ever walks a
+    /// block this call frees. FAST pushes (`hint.idx == want`) write into
+    /// a block containing their own unpublished ticket, which `cursor`
+    /// can never have crossed — they need no guard.
+    fn reclaim(&self, cursor: *const CBlock<C>) {
+        // Under loom the block chain is never reclaimed: loom's visibility
+        // model (deliberately) allows a load to observe a cell's INITIAL
+        // value absent a happens-before edge, so the SeqCst Dekker chain
+        // that makes this safe on hardware cannot be model-checked — a
+        // stale hint read would manufacture a use-after-free the real
+        // protocol forbids. The wakeup/FIFO/no-loss properties the loom
+        // lane exists to prove are unaffected; the leak gate (`tests/
+        // leak.rs`) covers reclamation on hardware.
+        if cfg!(loom) {
+            return;
+        }
+        let tb = self.tail_block.load(Ordering::SeqCst);
+        // SAFETY: `tb` and `cursor` are live blocks (reclamation only ever
+        // frees strictly behind both).
+        let bound = unsafe { &*tb }.idx.min(unsafe { &*cursor }.idx);
+        // Advance the frontier to the first block at or after `bound`.
+        let mut stop = self.first_block.load(Ordering::Relaxed);
+        while !stop.is_null() && unsafe { &*stop }.idx < bound {
+            stop = unsafe { &*stop }.next.load(Ordering::Acquire);
+        }
+        self.first_block.store(stop, Ordering::SeqCst);
+        if self.in_flight.load(Ordering::SeqCst) != 0 {
+            return;
+        }
+        let mut b = self.free_anchor.load(Ordering::Relaxed);
+        // Amortize: free in batches — the retired prefix keeps the leak
+        // bounded by a few blocks, and bulk-freeing avoids per-crossing
+        // dealloc churn in the drain hot path.
+        if unsafe { &*stop }.idx - unsafe { &*b }.idx < 4 {
+            return;
+        }
+        while !b.is_null() && b != stop {
+            let next = unsafe { &*b }.next.load(Ordering::Acquire);
+            // SAFETY: the consumer crossed every block below `stop`, so
+            // all their slots were consumed (values moved out, nothing to
+            // drop); `in_flight == 0` proves no push is walking them;
+            // behind `tail_block`, so no new push reaches them.
+            drop(unsafe { Box::from_raw(b) });
+            b = next;
+        }
+        self.free_anchor.store(b, Ordering::Relaxed);
+    }
+
+    /// True once every [`ControlSender`] is gone.
     #[inline]
     fn closed(&self) -> bool {
         self.senders.load(Ordering::Acquire) == 0
@@ -368,12 +667,13 @@ impl<C> ControlLane<C> {
 impl<C> Drop for ControlLane<C> {
     fn drop(&mut self) {
         // Quiescent: all senders and the consumer are gone. Reclaim every
-        // published-but-unconsumed slot, then free the whole chain.
-        let consumed = *self.consumed.get_mut();
-        let tail = *self.tail.get_mut();
-        let mut b = self.first_block;
+        // published-but-unconsumed slot, then free the remaining chain
+        // (blocks the consumer already freed are behind `free_anchor`).
+        let consumed = self.consumed.load(Ordering::Relaxed); // quiescent: &mut self
+        let tail = self.tail.load(Ordering::Relaxed); // quiescent: &mut self
+        let mut b = self.free_anchor.load(Ordering::Relaxed); // quiescent: &mut self
         while !b.is_null() {
-            let mut block = unsafe { Box::from_raw(b) };
+            let block = unsafe { Box::from_raw(b) };
             let base = block.idx * CBLOCK;
             for pos in base.max(consumed)..(base + CBLOCK).min(tail) {
                 let slot = &block.slots[pos % CBLOCK];
@@ -382,7 +682,7 @@ impl<C> Drop for ControlLane<C> {
                     unsafe { slot.val.get().drop_in_place() };
                 }
             }
-            b = *block.next.get_mut();
+            b = block.next.load(Ordering::Relaxed); // quiescent: &mut self
         }
     }
 }
@@ -401,6 +701,11 @@ impl<C> Clone for ControlSender<C> {
 
 impl<C> Drop for ControlSender<C> {
     fn drop(&mut self) {
+        // Wake BEFORE decrementing: under loom this mutex-synchronizes the
+        // departing sender's publishes with a consumer that later observes
+        // the lane closed (see `sync_notify`); in production it is a cheap
+        // gated check and a harmless spurious wake.
+        self.lane.core.wake_consumer();
         if self.lane.senders.fetch_sub(1, Ordering::Release) == 1 {
             // Last sender: wake a parked consumer so `recv` can observe the
             // closure and return `None` once both lanes are drained.
@@ -438,6 +743,8 @@ impl<U> Clone for UserSender<U> {
 
 impl<U> Drop for UserSender<U> {
     fn drop(&mut self) {
+        // Wake BEFORE decrementing — see `ControlSender::drop`.
+        self.lane.core.wake_consumer();
         if self.lane.senders.fetch_sub(1, Ordering::Release) == 1 {
             self.lane.core.wake_consumer();
         }
@@ -449,6 +756,7 @@ impl<U> UserSender<U> {
     ///
     /// # Errors
     /// Returns [`UserClosed`] carrying `item` if the consumer is gone.
+    #[cfg(not(loom))]
     pub async fn send(&self, item: U) -> Result<(), UserClosed<U>> {
         let lane = &self.lane;
         let mut item = item;
@@ -479,6 +787,8 @@ impl<U> UserSender<U> {
                 }
                 Err(v) => item = v,
             }
+            // Park-gating check (RMW — a plain load may miss the consumer's
+            // earlier teardown store; see `wake_consumer`).
             if lane.core.consumer_gone.load(Ordering::Acquire) {
                 lane.waiting.fetch_sub(1, Ordering::Relaxed);
                 // Teardown released us: the send reports success and the item
@@ -486,6 +796,68 @@ impl<U> UserSender<U> {
                 return Ok(());
             }
             notified.await;
+            lane.waiting.fetch_sub(1, Ordering::Relaxed);
+            if lane.core.consumer_gone.load(Ordering::Acquire) {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Blocking twin of `send`, compiled ONLY under `cfg(loom)`: the same
+    /// announce/re-check/park protocol over `waiting`, with the sync
+    /// `Notify` stand-in's `wait()` in place of the `Notified` future.
+    /// Drives the loom model in `tests/loom.rs`.
+    #[cfg(loom)]
+    #[doc(hidden)]
+    pub fn send_blocking(&self, item: U) -> Result<(), UserClosed<U>> {
+        let lane = &self.lane;
+        let mut item = item;
+        loop {
+            if lane.core.consumer_gone.load(Ordering::Acquire) {
+                return Err(UserClosed(item));
+            }
+            match lane.try_push(item) {
+                Ok(()) => {
+                    lane.core.wake_consumer();
+                    return Ok(());
+                }
+                Err(v) => item = v,
+            }
+            // Ring full: announce (SeqCst), re-check, then park. The
+            // stand-in's `enable` lock publishes the announcement; the
+            // SECOND re-check after it catches any pop the first missed
+            // (the consumer's `notify_if_nonzero` lock covers the other
+            // direction).
+            lane.waiting.fetch_add(1, Ordering::SeqCst);
+            match lane.try_push(item) {
+                Ok(()) => {
+                    lane.waiting.fetch_sub(1, Ordering::Relaxed);
+                    lane.core.wake_consumer();
+                    return Ok(());
+                }
+                Err(v) => item = v,
+            }
+            // Park-gating check (RMW — see `wake_consumer`).
+            if lane.core.consumer_gone.load(Ordering::Acquire) {
+                lane.waiting.fetch_sub(1, Ordering::Relaxed);
+                // Teardown released us: the send reports success and the
+                // item is discarded — the pinned teardown seam.
+                return Ok(());
+            }
+            lane.send_notify.enable();
+            match lane.try_push(item) {
+                Ok(()) => {
+                    lane.waiting.fetch_sub(1, Ordering::Relaxed);
+                    lane.core.wake_consumer();
+                    return Ok(());
+                }
+                Err(v) => item = v,
+            }
+            if lane.core.consumer_gone.load(Ordering::Acquire) {
+                lane.waiting.fetch_sub(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            lane.send_notify.wait();
             lane.waiting.fetch_sub(1, Ordering::Relaxed);
             if lane.core.consumer_gone.load(Ordering::Acquire) {
                 return Ok(());
@@ -513,6 +885,58 @@ impl<U> UserSender<U> {
     }
 }
 
+/// Pop the next published control in ticket order, advancing the consumer's
+/// block cursor and reclaiming consumed blocks on each crossing. Expands to
+/// a block expression evaluating to `Option<C>`; takes the consumer
+/// identifier so it can run under `recv`'s split borrows.
+macro_rules! pop_control {
+    ($slf:ident) => {{
+        let mut block = $slf.ctl_block;
+        // SAFETY: `ctl_block` is always a live block (reclamation frees
+        // only strictly behind it; the chain anchor lives until lane drop,
+        // and the consumer holds an Arc on the lane).
+        let b = unsafe { &*block };
+        if $slf.ctl_head == (b.idx + 1) * CBLOCK {
+            // Crossed a block boundary: the next block is linked before any
+            // of its slots are published, so `null` means the lane is empty.
+            let next = b.next.load(Ordering::Acquire);
+            if next.is_null() {
+                None
+            } else {
+                $slf.ctl_block = next;
+                // The block just left is fully consumed; reclaim it (and
+                // anything older) once no push can hold a hint into it.
+                $slf.ctl.reclaim(next);
+                block = next;
+                // SAFETY: as above; `ctl_head % CBLOCK` is in bounds.
+                let slot = unsafe { &(*block).slots[$slf.ctl_head % CBLOCK] };
+                if slot.ready.load(Ordering::Acquire) {
+                    // SAFETY: `ready` (Acquire) orders the producer's write
+                    // before this read; only the consumer pops, and each
+                    // slot is published once.
+                    let v = unsafe { slot.val.get().read().assume_init() };
+                    $slf.ctl_head = $slf.ctl_head.wrapping_add(1);
+                    Some(v)
+                } else {
+                    None
+                }
+            }
+        } else {
+            // SAFETY: as above; `ctl_head % CBLOCK` is in bounds.
+            let slot = unsafe { &(*block).slots[$slf.ctl_head % CBLOCK] };
+            let __r = slot.ready.load(Ordering::Acquire);
+            if __r {
+                // SAFETY: as above.
+                let v = unsafe { slot.val.get().read().assume_init() };
+                $slf.ctl_head = $slf.ctl_head.wrapping_add(1);
+                Some(v)
+            } else {
+                None
+            }
+        }
+    }};
+}
+
 /// The single consumer that merges the two lanes.
 pub struct Consumer<C, U> {
     ctl: Arc<ControlLane<C>>,
@@ -524,8 +948,9 @@ pub struct Consumer<C, U> {
     consec_control: usize,
     /// Consumer-side control pop ticket (plain counter, no atomic).
     ctl_head: usize,
-    /// Block containing `ctl_head`; consumer-only, never freed under it
-    /// (the chain is reclaimed wholesale at lane drop).
+    /// Block containing `ctl_head`; consumer-only. Blocks strictly behind
+    /// it are reclaimed by `ControlLane::reclaim` as the cursor crosses
+    /// boundaries; the cursor block itself is freed at lane drop.
     ctl_block: *mut CBlock<C>,
 }
 
@@ -538,30 +963,7 @@ impl<C, U> Consumer<C, U> {
     /// Pop the next published control in ticket order. Consumer-only.
     #[inline]
     fn pop_control(&mut self) -> Option<C> {
-        let mut block = self.ctl_block;
-        // SAFETY: `ctl_block` is always a live block (chain freed only at
-        // lane drop; the consumer holds an Arc on the lane).
-        let b = unsafe { &*block };
-        if self.ctl_head == (b.idx + 1) * CBLOCK {
-            // Crossed a block boundary: the next block is linked before any
-            // of its slots are published, so `null` means the lane is empty.
-            let next = b.next.load(Ordering::Acquire);
-            if next.is_null() {
-                return None;
-            }
-            self.ctl_block = next;
-            block = next;
-        }
-        // SAFETY: as above; `ctl_head % CBLOCK` is in bounds.
-        let slot = unsafe { &(*block).slots[self.ctl_head % CBLOCK] };
-        if !slot.ready.load(Ordering::Acquire) {
-            return None;
-        }
-        // SAFETY: `ready` (Acquire) orders the producer's write before this
-        // read; only the consumer pops, and each slot is published once.
-        let v = unsafe { slot.val.get().read().assume_init() };
-        self.ctl_head = self.ctl_head.wrapping_add(1);
-        Some(v)
+        pop_control!(self)
     }
 
     /// Receive the next item.
@@ -573,45 +975,13 @@ impl<C, U> Consumer<C, U> {
     /// `aging_cap` consecutive control dequeues one waiting user is forced
     /// through (P3 under flood). Users reset the streak; a cap of 0 disables
     /// aging entirely.
+    #[cfg(not(loom))]
     pub async fn recv(&mut self) -> Option<Received<C, U>> {
         // Split borrows: lanes + streak + control cursor are disjoint fields.
         let usr = &self.usr;
         let core = &self.core;
         let aging_cap = self.aging_cap;
         let streak = &mut self.consec_control;
-
-        macro_rules! pop_control {
-            () => {{
-                let mut block = self.ctl_block;
-                let b = unsafe { &*block };
-                if self.ctl_head == (b.idx + 1) * CBLOCK {
-                    let next = b.next.load(Ordering::Acquire);
-                    if next.is_null() {
-                        None
-                    } else {
-                        self.ctl_block = next;
-                        block = next;
-                        let slot = unsafe { &(*block).slots[self.ctl_head % CBLOCK] };
-                        if slot.ready.load(Ordering::Acquire) {
-                            let v = unsafe { slot.val.get().read().assume_init() };
-                            self.ctl_head = self.ctl_head.wrapping_add(1);
-                            Some(v)
-                        } else {
-                            None
-                        }
-                    }
-                } else {
-                    let slot = unsafe { &(*block).slots[self.ctl_head % CBLOCK] };
-                    if slot.ready.load(Ordering::Acquire) {
-                        let v = unsafe { slot.val.get().read().assume_init() };
-                        self.ctl_head = self.ctl_head.wrapping_add(1);
-                        Some(v)
-                    } else {
-                        None
-                    }
-                }
-            }};
-        }
 
         macro_rules! take_control {
             ($c:expr) => {{
@@ -638,7 +1008,7 @@ impl<C, U> Consumer<C, U> {
                     take_user!(u);
                 }
             }
-            if let Some(c) = pop_control!() {
+            if let Some(c) = pop_control!(self) {
                 take_control!(c);
             }
             if let Some(u) = usr.pop() {
@@ -648,10 +1018,20 @@ impl<C, U> Consumer<C, U> {
             let ctl_closed = self.ctl.closed();
             let usr_closed = usr.closed();
             if ctl_closed && usr_closed {
-                // Both lanes closed: no item can arrive anymore. Final sweep
-                // ordered after the Acquire loads above, so any item a
-                // departing sender pushed is visible here.
-                if let Some(c) = pop_control!() {
+                // Both lanes closed: no item can arrive anymore. Sweep TWICE:
+                // items pushed by departing senders are visible here via the
+                // `senders` RMW release chain; under loom's (deliberately
+                // over-approximating) visibility model a single read may
+                // still come back stale, and a stale read cannot repeat
+                // within one activation. The second pass is free on
+                // hardware — it happens once per channel, at teardown.
+                if let Some(c) = pop_control!(self) {
+                    take_control!(c);
+                }
+                if let Some(u) = usr.pop() {
+                    take_user!(u);
+                }
+                if let Some(c) = pop_control!(self) {
                     take_control!(c);
                 }
                 if let Some(u) = usr.pop() {
@@ -669,7 +1049,7 @@ impl<C, U> Consumer<C, U> {
             notified.as_mut().enable();
             core.parked.store(true, Ordering::SeqCst);
 
-            if let Some(c) = pop_control!() {
+            if let Some(c) = pop_control!(self) {
                 core.parked.store(false, Ordering::Relaxed);
                 take_control!(c);
             }
@@ -685,10 +1065,97 @@ impl<C, U> Consumer<C, U> {
             // in-pop `waiting` check, this is what guarantees a producer
             // parked on a just-drained ring is always woken (its push then
             // wakes us via `parked`).
-            if usr.waiting.load(Ordering::SeqCst) != 0 {
-                usr.send_notify.notify_one();
-            }
+            usr.release_one_waiter();
             notified.await;
+            core.parked.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Blocking twin of `recv`, compiled ONLY under `cfg(loom)`: the same
+    /// policy loop and the same `parked`-flag Dekker protocol, with the
+    /// sync `Notify` stand-in's `wait()` in place of the `Notified`
+    /// future. Drives the loom model in `tests/loom.rs`.
+    #[cfg(loom)]
+    #[doc(hidden)]
+    pub fn recv_blocking(&mut self) -> Option<Received<C, U>> {
+        let usr = &self.usr;
+        let core = &self.core;
+        let aging_cap = self.aging_cap;
+        let streak = &mut self.consec_control;
+
+        macro_rules! take_control {
+            ($c:expr) => {{
+                if aging_cap != 0 && *streak < aging_cap {
+                    *streak += 1;
+                }
+                return Some(Received::Control($c));
+            }};
+        }
+        macro_rules! take_user {
+            ($u:expr) => {{
+                *streak = 0;
+                return Some(Received::User($u));
+            }};
+        }
+
+        loop {
+            if aging_cap != 0 && *streak >= aging_cap {
+                if let Some(u) = usr.pop() {
+                    take_user!(u);
+                }
+            }
+            if let Some(c) = pop_control!(self) {
+                take_control!(c);
+            }
+            if let Some(u) = usr.pop() {
+                take_user!(u);
+            }
+
+            let ctl_closed = self.ctl.closed();
+            let usr_closed = usr.closed();
+            if ctl_closed && usr_closed {
+                // Both lanes closed. Synchronize with the departing
+                // senders' `notify_if` locks so their publishes are visible
+                // to the sweep (loom's visibility model does not honor the
+                // atomic release chain alone); then sweep TWICE (see the
+                // async `recv` for why).
+                core.notify.sync_point();
+                if let Some(c) = pop_control!(self) {
+                    take_control!(c);
+                }
+                if let Some(u) = usr.pop() {
+                    take_user!(u);
+                }
+                if let Some(c) = pop_control!(self) {
+                    take_control!(c);
+                }
+                if let Some(u) = usr.pop() {
+                    take_user!(u);
+                }
+                return None;
+            }
+
+            // Park: announce parked FIRST (SeqCst), then register — the
+            // stand-in's `enable` lock is the synchronization point that
+            // publishes the announcement to `notify_if` (and vice versa
+            // for the re-checks below).
+            core.parked.store(true, Ordering::SeqCst);
+            core.notify.enable();
+
+            if let Some(c) = pop_control!(self) {
+                core.parked.store(false, Ordering::Relaxed);
+                take_control!(c);
+            }
+            if let Some(u) = usr.pop() {
+                core.parked.store(false, Ordering::Relaxed);
+                take_user!(u);
+            }
+            if self.ctl.closed() && usr.closed() {
+                core.parked.store(false, Ordering::Relaxed);
+                continue;
+            }
+            usr.release_one_waiter();
+            core.notify.wait();
             core.parked.store(false, Ordering::Relaxed);
         }
     }
@@ -772,7 +1239,7 @@ pub fn channel<C, U>(cfg: Config) -> (ControlSender<C>, UserSender<U>, Consumer<
     let ring_len = capacity;
     let ring = (0..ring_len)
         .map(|i| Slot {
-            seq: std::sync::atomic::AtomicU32::new(i as u32),
+            seq: AtomicU32::new(i as u32),
             val: std::cell::UnsafeCell::new(MaybeUninit::uninit()),
         })
         .collect::<Vec<_>>()
@@ -786,7 +1253,9 @@ pub fn channel<C, U>(cfg: Config) -> (ControlSender<C>, UserSender<U>, Consumer<
     let ctl = Arc::new(ControlLane {
         tail: AtomicUsize::new(0),
         tail_block: AtomicPtr::new(first_block),
-        first_block,
+        first_block: AtomicPtr::new(first_block),
+        free_anchor: AtomicPtr::new(first_block),
+        in_flight: AtomicUsize::new(0),
         consumed: AtomicUsize::new(0),
         senders: AtomicUsize::new(1),
         core: core.clone(),

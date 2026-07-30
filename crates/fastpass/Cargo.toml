@@ -13,6 +13,12 @@ description = "Priority-merge of two FIFO streams into one consumer (bombay card
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 
+# Model-check lane: `tests/loom.rs` runs the wakeup protocol exhaustively
+# under `RUSTFLAGS="--cfg loom"` (see .auto/checks.sh). Not a normal build
+# dependency.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 [dev-dependencies]
 fastpass-testkit = { workspace = true }
 tokio = { workspace = true, features = [
