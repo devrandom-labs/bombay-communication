@@ -384,7 +384,7 @@ impl<U> UserLane<U> {
         // Wake one parked producer, if any — checked every 4th pop only;
         // a parked producer is also released by the consumer's pre-park
         // check, so it can never sleep past an empty ring.
-        if head % 4 == 0 {
+        if head % 8 == 0 {
             self.release_one_waiter();
         }
         Some(v)
