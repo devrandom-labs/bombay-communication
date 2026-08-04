@@ -32,7 +32,8 @@
 //! 5. `closed_empty_recv_returns_none_repeatedly` — pins the load-bearing
 //!    early return before the parked `select!`: with both lanes closed both
 //!    arms are disabled, and `tokio::select!` with no enabled arm and no
-//!    `else` panics.
+//!    `else` panics. Since the lane-lifecycle addition the one-shot
+//!    `UserLaneClosed` end-marker precedes the first `None`.
 
 use fastpass::{Config, Received, channel};
 use std::time::Duration;
@@ -58,6 +59,9 @@ async fn cap_zero_rendezvous_loses_nothing() {
         match timeout(GUARD, rx.recv()).await.expect("rendezvous recv stalled") {
             Some(Received::User(u)) => got_u.push(u),
             Some(Received::Control(c)) => got_c.push(c),
+            // End-marker (post-#225 lane-lifecycle addition): not a payload
+            // item; the loop bound counts only payload.
+            Some(Received::UserLaneClosed) => {}
             None => break,
         }
     }
@@ -94,6 +98,9 @@ async fn recv_future_cancellation_loses_nothing() {
             x = rx.recv() => match x {
                 Some(Received::Control(c)) => got_c.push(c),
                 Some(Received::User(u)) => got_u.push(u),
+                // End-marker: possible once the producer's senders drop with
+                // the ring drained; not a payload item.
+                Some(Received::UserLaneClosed) => {}
                 None => break,
             },
             _ = tokio::time::sleep(Duration::from_micros(50)) => cancels += 1,
@@ -162,6 +169,9 @@ async fn default_config_is_pure_strict_priority() {
                 );
             }
             Received::User(_) => saw_user = true,
+            // End-marker: fires after the last user item, so it cannot
+            // disturb the strict-priority assertion above.
+            Received::UserLaneClosed => {}
         }
     }
     assert_eq!(controls, 32);
@@ -172,8 +182,14 @@ async fn closed_empty_recv_returns_none_repeatedly() {
     let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(1));
     drop(ctl);
     drop(usr);
+    // Since the lane-lifecycle addition the one-shot end-marker comes FIRST
+    // (the user lane is terminally closed and drained); `None` follows.
+    assert!(matches!(
+        timeout(GUARD, rx.recv()).await.expect("marker recv stalled"),
+        Some(Received::UserLaneClosed)
+    ));
     assert!(timeout(GUARD, rx.recv()).await.expect("first recv stalled").is_none());
-    // Second call: both closed flags set. The early return must fire before the
+    // Second None call: both closed flags set. The early return must fire before the
     // parked select! — with both arms disabled and no else, select! panics.
     assert!(timeout(GUARD, rx.recv()).await.expect("second recv stalled").is_none());
 }

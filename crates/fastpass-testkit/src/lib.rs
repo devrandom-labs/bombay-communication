@@ -9,22 +9,28 @@
 //!
 //! ```ignore
 //! pub struct Config;                       // Config::new(user_cap).with_aging_cap(k)
-//! pub enum   Received<C, U> { Control(C), User(U) }
+//! pub enum   Received<C, U> { Control(C), User(U), UserLaneClosed }
 //! pub struct Drained<C, U>  { pub control: Vec<C>, pub user: Vec<U> }
 //! pub fn channel<C, U>(cfg: Config) -> (ControlSender<C>, UserSender<U>, Consumer<C, U>);
 //! // ControlSender::send(C)              -> Result<(), ControlClosed<C>>   (never blocks)
 //! // UserSender::send(U).await           -> Result<(), UserClosed<U>>      (bounded backpressure)
 //! // UserSender::try_send(U)             -> Result<(), TrySendError<U>>
 //! // Consumer::recv().await              -> Option<Received<C, U>>         (None once drained + closed)
+//! // Consumer::recv_control().await      -> Option<C>                     (control-only; None once closed + drained)
 //! // Consumer::drain(self)               -> Drained<C, U>
 //! ```
+//!
+//! `Received::UserLaneClosed` is the user stream's one-shot end-marker: it
+//! fires exactly once, after the last user item, only once every
+//! `UserSender` is gone — subject to the same control-first priority and
+//! aging as a user item.
 //!
 //! Invoke [`property_suite!`] and [`alloc_guard!`] from each subject crate's
 //! `tests/` directory, passing the crate name.
 
-/// Emit the full P1–P6 + ordering + anti-starvation property suite against
-/// `$fp::channel`. Every awaited `recv` is wrapped in a timeout so a
-/// deadlocking or lost-wakeup implementation FAILS the test rather than
+/// Emit the full P1–P6 + ordering + anti-starvation + lane-lifecycle property
+/// suite against `$fp::channel`. Every awaited `recv` is wrapped in a timeout
+/// so a deadlocking or lost-wakeup implementation FAILS the test rather than
 /// hanging the whole run — essential for the autoresearch measure loop.
 #[macro_export]
 macro_rules! property_suite {
@@ -61,6 +67,9 @@ macro_rules! property_suite {
                     Received::User(u) => {
                         panic!("user {u} served before control — head-of-line blocking (P1)")
                     }
+                    Received::UserLaneClosed => {
+                        panic!("user lane reported closed while a UserSender lives")
+                    }
                 }
             }
 
@@ -82,6 +91,9 @@ macro_rules! property_suite {
                     match x {
                         Received::Control(c) => controls.push(c),
                         Received::User(u) => users.push(u),
+                        // The user stream's end-marker: expected here (both
+                        // senders dropped), not part of the FIFO multisets.
+                        Received::UserLaneClosed => {}
                     }
                 }
                 assert_eq!(controls, vec![1, 2, 3], "control lane not FIFO (P2)");
@@ -101,6 +113,9 @@ macro_rules! property_suite {
                     match recv1(&mut rx).await {
                         Received::User(u) => users.push(u),
                         Received::Control(c) => panic!("phantom control {c} (P3)"),
+                        Received::UserLaneClosed => {
+                            panic!("user lane reported closed while a UserSender lives")
+                        }
                     }
                 }
                 assert_eq!(users, (0..8).collect::<Vec<_>>(), "users must flow (P3)");
@@ -132,6 +147,9 @@ macro_rules! property_suite {
                     match timeout(GUARD, rx.recv()).await.expect("no timeout") {
                         Some(Received::Control(c)) => assert!(controls.insert(c), "dup control {c}"),
                         Some(Received::User(u)) => assert!(users.insert(u), "dup user {u}"),
+                        // End-marker, delivered once both lanes are closed
+                        // and the ring drained; not part of the multisets.
+                        Some(Received::UserLaneClosed) => {}
                         None => break,
                     }
                 }
@@ -251,6 +269,189 @@ macro_rules! property_suite {
                     }
                 }
                 assert_eq!(users, (0..10).collect::<Vec<_>>(), "user FIFO broke under interleave");
+            }
+
+            // Lifecycle (1) — `UserLaneClosed` fires AT MOST once per channel.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn user_lane_closed_fires_at_most_once() {
+                let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(8));
+                usr.try_send(1).unwrap();
+                drop(usr);
+                assert!(matches!(recv1(&mut rx).await, Received::User(1)));
+                assert!(matches!(recv1(&mut rx).await, Received::UserLaneClosed));
+                // The latch holds: with the control lane still open, further
+                // recvs serve control only — never a second leg.
+                ctl.send(7).unwrap();
+                assert!(matches!(recv1(&mut rx).await, Received::Control(7)));
+                drop(ctl);
+                while let Some(x) = timeout(GUARD, rx.recv()).await.expect("recv stalled") {
+                    assert!(
+                        !matches!(x, Received::UserLaneClosed),
+                        "UserLaneClosed fired twice — the one-shot latch is broken"
+                    );
+                }
+            }
+
+            // Lifecycle (2) — the leg fires only after every sent user item
+            // was received; no user item ever appears after it.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn user_lane_closed_only_after_all_user_items() {
+                let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(16));
+                for i in 0..10u32 {
+                    usr.try_send(i).unwrap();
+                }
+                ctl.send(999).unwrap(); // control-first: served before the users
+                drop(usr);
+                drop(ctl);
+
+                let mut users = Vec::new();
+                let mut legs = 0u32;
+                while let Some(x) = timeout(GUARD, rx.recv()).await.expect("recv stalled") {
+                    match x {
+                        Received::Control(_) => {}
+                        Received::User(u) => {
+                            assert_eq!(legs, 0, "user {u} served after UserLaneClosed");
+                            users.push(u);
+                        }
+                        Received::UserLaneClosed => {
+                            legs += 1;
+                            assert_eq!(
+                                users,
+                                (0..10).collect::<Vec<_>>(),
+                                "UserLaneClosed fired before every user item was received"
+                            );
+                        }
+                    }
+                }
+                assert_eq!(legs, 1, "UserLaneClosed must fire exactly once");
+            }
+
+            // Lifecycle (3) — the leg never fires while any `UserSender` (or
+            // clone) is alive, even with the ring drained.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn user_lane_closed_never_fires_while_sender_alive() {
+                let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(8));
+                let usr2 = usr.clone();
+                usr.try_send(1).unwrap();
+                drop(usr); // one clone remains: the lane is NOT closed
+
+                assert!(matches!(recv1(&mut rx).await, Received::User(1)));
+                // Ring drained, a clone alive, control lane open: recv must
+                // PARK — no leg, no None. (Deterministic: nothing can wake or
+                // satisfy the consumer, so only the timeout fires.)
+                assert!(
+                    timeout(Duration::from_millis(100), rx.recv()).await.is_err(),
+                    "recv returned while a UserSender clone lives (premature leg or None)"
+                );
+                usr2.try_send(2).unwrap();
+                assert!(matches!(recv1(&mut rx).await, Received::User(2)));
+                drop(usr2);
+                assert!(matches!(recv1(&mut rx).await, Received::UserLaneClosed));
+                drop(ctl);
+                assert!(timeout(GUARD, rx.recv()).await.expect("recv stalled").is_none());
+            }
+
+            // Lifecycle (4) — after the leg, `recv` keeps serving control
+            // items; `None` only once the control lane is also closed and
+            // drained.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn user_lane_closed_then_control_continues_until_none() {
+                let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(8).with_aging_cap(1));
+                ctl.send(0).unwrap();
+                ctl.send(1).unwrap();
+                ctl.send(2).unwrap();
+                usr.try_send(100).unwrap();
+                drop(usr);
+
+                // Aging cap 1 interleaves control and the user stream; the
+                // leg takes the user slot right after the last user item.
+                let expected = [
+                    Received::Control(0),
+                    Received::User(100),
+                    Received::Control(1),
+                    Received::UserLaneClosed,
+                    Received::Control(2),
+                ];
+                for want in expected {
+                    assert_eq!(recv1(&mut rx).await, want);
+                }
+                // Control lane still open: NOT None — a fresh control is served.
+                ctl.send(3).unwrap();
+                assert_eq!(recv1(&mut rx).await, Received::Control(3));
+                drop(ctl);
+                assert!(timeout(GUARD, rx.recv()).await.expect("recv stalled").is_none());
+            }
+
+            // Lifecycle (5) — `recv_control` serves control in ticket (FIFO)
+            // order and never reduces the user items the consumer later
+            // observes.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn recv_control_fifo_and_never_consumes_user_items() {
+                let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(8));
+                for i in 0..8u32 {
+                    usr.try_send(i).unwrap(); // ring FULL: control reads must not touch it
+                }
+                for i in 0..4u32 {
+                    ctl.send(i).unwrap();
+                }
+                let mut controls = Vec::new();
+                for _ in 0..4 {
+                    controls.push(
+                        timeout(GUARD, rx.recv_control())
+                            .await
+                            .expect("recv_control stalled")
+                            .expect("control item expected"),
+                    );
+                }
+                assert_eq!(controls, (0..4).collect::<Vec<_>>(), "recv_control not FIFO");
+                // Every user item is still there, in order: close the user
+                // lane and drain to the end-marker (a stolen item shrinks
+                // the drained count, failing the assert — never a stall).
+                drop(usr);
+                let mut users = Vec::new();
+                loop {
+                    match recv1(&mut rx).await {
+                        Received::User(u) => users.push(u),
+                        Received::UserLaneClosed => break,
+                        x => panic!("expected a user item or the end-marker, got {x:?}"),
+                    }
+                }
+                assert_eq!(users, (0..8).collect::<Vec<_>>(), "recv_control consumed user items");
+            }
+
+            // Lifecycle (6) — `recv_control` returns `None` only when the
+            // control lane is closed AND drained; a queued item beats the
+            // closure, and an open lane parks instead.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn recv_control_none_only_when_control_closed_and_drained() {
+                let (ctl, _usr, mut rx) = channel::<u32, u32>(Config::new(8));
+                // Open + empty: parks (no None while a sender lives).
+                assert!(
+                    timeout(Duration::from_millis(100), rx.recv_control()).await.is_err(),
+                    "recv_control returned on an open, empty control lane"
+                );
+                // Queued item + closed lane: the item comes first, then None
+                // (stable).
+                ctl.send(1).unwrap();
+                drop(ctl);
+                assert_eq!(
+                    timeout(GUARD, rx.recv_control()).await.expect("recv_control stalled"),
+                    Some(1),
+                    "queued control lost to the lane closure"
+                );
+                assert_eq!(
+                    timeout(GUARD, rx.recv_control()).await.expect("recv_control stalled"),
+                    None,
+                    "control lane closed and drained — must be None"
+                );
+                // And on a fresh channel closed with an EMPTY queue: None at once.
+                let (ctl2, _usr2, mut rx2) = channel::<u32, u32>(Config::new(8));
+                drop(ctl2);
+                assert_eq!(
+                    timeout(GUARD, rx2.recv_control()).await.expect("recv_control stalled"),
+                    None,
+                    "closed empty control lane must yield None"
+                );
             }
         }
     };

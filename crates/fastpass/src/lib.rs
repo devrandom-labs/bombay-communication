@@ -212,6 +212,13 @@ pub enum Received<C, U> {
     Control(C),
     /// A user-lane item.
     User(U),
+    /// The user lane is TERMINALLY closed: every `UserSender` is gone and
+    /// the ring is drained. Delivered EXACTLY ONCE, in the user stream's
+    /// FIFO position (after the last user item), subject to the same
+    /// control-first priority and aging as a user item. Terminal by
+    /// construction: no `UserSender` source exists besides `channel()`
+    /// and `Clone`, so a zero count can never rise again.
+    UserLaneClosed,
 }
 
 /// Items still queued when the consumer tears down (see [`Consumer::drain`]).
@@ -384,7 +391,7 @@ impl<U> UserLane<U> {
         // Wake one parked producer, if any — checked every 4th pop only;
         // a parked producer is also released by the consumer's pre-park
         // check, so it can never sleep past an empty ring.
-        if head % 8 == 0 {
+        if head.is_multiple_of(8) {
             self.release_one_waiter();
         }
         Some(v)
@@ -959,6 +966,10 @@ pub struct Consumer<C, U> {
     /// it are reclaimed by `ControlLane::reclaim` as the cursor crosses
     /// boundaries; the cursor block itself is freed at lane drop.
     ctl_block: *mut CBlock<C>,
+    /// One-shot latch: the `Received::UserLaneClosed` end-marker has been
+    /// delivered. Plain consumer-side state — the consumer is single-owner,
+    /// so no atomics.
+    usr_closed_reported: bool,
 }
 
 // SAFETY: `ctl_block` is dereferenced only by the consumer that owns it, and
@@ -982,13 +993,20 @@ impl<C, U> Consumer<C, U> {
     /// `aging_cap` consecutive control dequeues one waiting user is forced
     /// through (P3 under flood). Users reset the streak; a cap of 0 disables
     /// aging entirely.
+    ///
+    /// Once every `UserSender` is gone AND the ring is drained, the user
+    /// stream's one-shot end-marker ([`Received::UserLaneClosed`]) is
+    /// delivered through the same path a user item takes — control keeps its
+    /// priority over it, aging forces it through exactly as for users, and
+    /// it resets the streak (it IS the user stream's end-marker).
     #[cfg(not(loom))]
     pub async fn recv(&mut self) -> Option<Received<C, U>> {
-        // Split borrows: lanes + streak + control cursor are disjoint fields.
+        // Split borrows: lanes + streak + latch + control cursor are disjoint fields.
         let usr = &self.usr;
         let core = &self.core;
         let aging_cap = self.aging_cap;
         let streak = &mut self.consec_control;
+        let leg_reported = &mut self.usr_closed_reported;
 
         macro_rules! take_control {
             ($c:expr) => {{
@@ -1006,21 +1024,41 @@ impl<C, U> Consumer<C, U> {
                 return Some(Received::User($u));
             }};
         }
+        macro_rules! take_leg {
+            () => {{
+                // The user stream's end-marker takes the user slot: it
+                // resets the aging streak exactly as a user item would.
+                *leg_reported = true;
+                *streak = 0;
+                return Some(Received::UserLaneClosed);
+            }};
+        }
+        // User-pop site, leg-aware: a drained ring whose lane is TERMINALLY
+        // closed yields the one-shot end-marker instead of a plain miss.
+        // `closed()` is monotone (a zero sender count can never rise again),
+        // so a stale read can only delay the leg a loop turn, never fire it
+        // early.
+        macro_rules! pop_user_or_leg {
+            () => {
+                match usr.pop() {
+                    Some(u) => take_user!(u),
+                    None if !*leg_reported && usr.closed() => take_leg!(),
+                    None => {}
+                }
+            };
+        }
 
         loop {
             // Aging safety net: the streak reached the cap and a user is
-            // waiting — serve it before any more control.
+            // waiting — serve it before any more control. The end-marker is
+            // forced through here exactly as a user item.
             if aging_cap != 0 && *streak >= aging_cap {
-                if let Some(u) = usr.pop() {
-                    take_user!(u);
-                }
+                pop_user_or_leg!();
             }
             if let Some(c) = pop_control!(self) {
                 take_control!(c);
             }
-            if let Some(u) = usr.pop() {
-                take_user!(u);
-            }
+            pop_user_or_leg!();
 
             let ctl_closed = self.ctl.closed();
             let usr_closed = usr.closed();
@@ -1032,18 +1070,17 @@ impl<C, U> Consumer<C, U> {
                 // still come back stale, and a stale read cannot repeat
                 // within one activation. The second pass is free on
                 // hardware — it happens once per channel, at teardown.
+                // The user pops are leg-aware: the end-marker (delivered
+                // already if the user lane died first) is not re-fired, and
+                // a stale `closed()` read that delayed it is caught here.
                 if let Some(c) = pop_control!(self) {
                     take_control!(c);
                 }
-                if let Some(u) = usr.pop() {
-                    take_user!(u);
-                }
+                pop_user_or_leg!();
                 if let Some(c) = pop_control!(self) {
                     take_control!(c);
                 }
-                if let Some(u) = usr.pop() {
-                    take_user!(u);
-                }
+                pop_user_or_leg!();
                 return None;
             }
 
@@ -1060,9 +1097,20 @@ impl<C, U> Consumer<C, U> {
                 core.parked.store(false, Ordering::Relaxed);
                 take_control!(c);
             }
-            if let Some(u) = usr.pop() {
-                core.parked.store(false, Ordering::Relaxed);
-                take_user!(u);
+            match usr.pop() {
+                Some(u) => {
+                    core.parked.store(false, Ordering::Relaxed);
+                    take_user!(u);
+                }
+                // The leg must be observable from the PARKED path too: the
+                // last-sender drop wakes this registration, and the
+                // re-check delivers the end-marker instead of parking on a
+                // dead user lane.
+                None if !*leg_reported && usr.closed() => {
+                    core.parked.store(false, Ordering::Relaxed);
+                    take_leg!();
+                }
+                None => {}
             }
             if self.ctl.closed() && usr.closed() {
                 core.parked.store(false, Ordering::Relaxed);
@@ -1089,6 +1137,7 @@ impl<C, U> Consumer<C, U> {
         let core = &self.core;
         let aging_cap = self.aging_cap;
         let streak = &mut self.consec_control;
+        let leg_reported = &mut self.usr_closed_reported;
 
         macro_rules! take_control {
             ($c:expr) => {{
@@ -1104,19 +1153,33 @@ impl<C, U> Consumer<C, U> {
                 return Some(Received::User($u));
             }};
         }
+        macro_rules! take_leg {
+            () => {{
+                *leg_reported = true;
+                *streak = 0;
+                return Some(Received::UserLaneClosed);
+            }};
+        }
+        // See the async `recv`: a drained, terminally closed user lane
+        // yields its one-shot end-marker at every user-pop site.
+        macro_rules! pop_user_or_leg {
+            () => {
+                match usr.pop() {
+                    Some(u) => take_user!(u),
+                    None if !*leg_reported && usr.closed() => take_leg!(),
+                    None => {}
+                }
+            };
+        }
 
         loop {
             if aging_cap != 0 && *streak >= aging_cap {
-                if let Some(u) = usr.pop() {
-                    take_user!(u);
-                }
+                pop_user_or_leg!();
             }
             if let Some(c) = pop_control!(self) {
                 take_control!(c);
             }
-            if let Some(u) = usr.pop() {
-                take_user!(u);
-            }
+            pop_user_or_leg!();
 
             let ctl_closed = self.ctl.closed();
             let usr_closed = usr.closed();
@@ -1125,20 +1188,18 @@ impl<C, U> Consumer<C, U> {
                 // senders' `notify_if` locks so their publishes are visible
                 // to the sweep (loom's visibility model does not honor the
                 // atomic release chain alone); then sweep TWICE (see the
-                // async `recv` for why).
+                // async `recv` for why). The sync point also publishes the
+                // final `senders` decrement, so the leg-aware user pops
+                // below observe the closure.
                 core.notify.sync_point();
                 if let Some(c) = pop_control!(self) {
                     take_control!(c);
                 }
-                if let Some(u) = usr.pop() {
-                    take_user!(u);
-                }
+                pop_user_or_leg!();
                 if let Some(c) = pop_control!(self) {
                     take_control!(c);
                 }
-                if let Some(u) = usr.pop() {
-                    take_user!(u);
-                }
+                pop_user_or_leg!();
                 return None;
             }
 
@@ -1153,15 +1214,114 @@ impl<C, U> Consumer<C, U> {
                 core.parked.store(false, Ordering::Relaxed);
                 take_control!(c);
             }
-            if let Some(u) = usr.pop() {
-                core.parked.store(false, Ordering::Relaxed);
-                take_user!(u);
+            match usr.pop() {
+                Some(u) => {
+                    core.parked.store(false, Ordering::Relaxed);
+                    take_user!(u);
+                }
+                None if !*leg_reported && usr.closed() => {
+                    core.parked.store(false, Ordering::Relaxed);
+                    take_leg!();
+                }
+                None => {}
             }
             if self.ctl.closed() && usr.closed() {
                 core.parked.store(false, Ordering::Relaxed);
                 continue;
             }
             usr.release_one_waiter();
+            core.notify.wait();
+            core.parked.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Receive the next CONTROL item only, never consuming the user lane.
+    /// `None` once the control lane is closed and drained. Cancel-safe under
+    /// the same registration protocol as `recv`; a user-lane push may cause a
+    /// spurious wake (one extra loop turn), never a lost wakeup and never a
+    /// consumed user item.
+    ///
+    /// This path consumes no user items, so it must NOT call
+    /// `usr.release_one_waiter()`: releasing a producer parked on a full ring
+    /// would just re-park it — and the semantics WANT user producers to stay
+    /// parked while the process is parked-for-restart (that is the
+    /// backpressure). The aging streak (`consec_control`) is untouched.
+    #[cfg(not(loom))]
+    pub async fn recv_control(&mut self) -> Option<C> {
+        let core = &self.core;
+        loop {
+            if let Some(c) = pop_control!(self) {
+                return Some(c);
+            }
+            if self.ctl.closed() {
+                // Control lane closed: no item can arrive anymore. Sweep
+                // TWICE — the same discipline `recv` documents for the
+                // both-closed path (departing control senders' publishes).
+                if let Some(c) = pop_control!(self) {
+                    return Some(c);
+                }
+                if let Some(c) = pop_control!(self) {
+                    return Some(c);
+                }
+                return None;
+            }
+
+            // Park with the identical enable-then-recheck `parked` protocol
+            // as `recv`, minus all user-lane interaction.
+            let notified = core.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            core.parked.store(true, Ordering::SeqCst);
+
+            if let Some(c) = pop_control!(self) {
+                core.parked.store(false, Ordering::Relaxed);
+                return Some(c);
+            }
+            if self.ctl.closed() {
+                core.parked.store(false, Ordering::Relaxed);
+                continue; // loop around to the sweep-and-`None` path
+            }
+            notified.await;
+            core.parked.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// The `cfg(loom)` blocking twin (drives the loom model).
+    #[cfg(loom)]
+    #[doc(hidden)]
+    pub fn recv_control_blocking(&mut self) -> Option<C> {
+        let core = &self.core;
+        loop {
+            if let Some(c) = pop_control!(self) {
+                return Some(c);
+            }
+            if self.ctl.closed() {
+                // Same double-sweep discipline as `recv_blocking`'s
+                // both-closed path: synchronize with the departing control
+                // senders' `notify_if` locks, then sweep TWICE.
+                core.notify.sync_point();
+                if let Some(c) = pop_control!(self) {
+                    return Some(c);
+                }
+                if let Some(c) = pop_control!(self) {
+                    return Some(c);
+                }
+                return None;
+            }
+
+            // The identical announce-then-register `parked` protocol as
+            // `recv_blocking`, minus all user-lane interaction.
+            core.parked.store(true, Ordering::SeqCst);
+            core.notify.enable();
+
+            if let Some(c) = pop_control!(self) {
+                core.parked.store(false, Ordering::Relaxed);
+                return Some(c);
+            }
+            if self.ctl.closed() {
+                core.parked.store(false, Ordering::Relaxed);
+                continue;
+            }
             core.notify.wait();
             core.parked.store(false, Ordering::Relaxed);
         }
@@ -1287,6 +1447,7 @@ pub fn channel<C, U>(cfg: Config) -> (ControlSender<C>, UserSender<U>, Consumer<
             consec_control: 0,
             ctl_head: 0,
             ctl_block: first_block,
+            usr_closed_reported: false,
         },
     )
 }

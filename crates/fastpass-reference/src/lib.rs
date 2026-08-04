@@ -74,6 +74,13 @@ pub enum Received<C, U> {
     Control(C),
     /// A user-lane item.
     User(U),
+    /// The user lane is TERMINALLY closed: every `UserSender` is gone and
+    /// the queue is drained. Delivered EXACTLY ONCE, in the user stream's
+    /// FIFO position (after the last user item), subject to the same
+    /// control-first priority and aging as a user item. Terminal by
+    /// construction: no `UserSender` source exists besides `channel()`
+    /// and `Clone`, so a zero count can never rise again.
+    UserLaneClosed,
 }
 
 /// Items still queued when the consumer tears down (see [`Consumer::drain`]).
@@ -169,6 +176,9 @@ pub struct Consumer<C, U> {
     consec_control: usize,
     ctl_closed: bool,
     usr_closed: bool,
+    /// One-shot latch: the `Received::UserLaneClosed` end-marker has been
+    /// delivered. Plain consumer-side state (single owner, no atomics).
+    usr_closed_reported: bool,
     _marker: PhantomData<(C, U)>,
 }
 
@@ -187,10 +197,26 @@ impl<C, U> Consumer<C, U> {
     ///
     /// Returns `None` only once both lanes are closed (all senders dropped) and
     /// both are empty.
+    ///
+    /// Once every `UserSender` is gone AND the queue is drained (flume reports
+    /// `Disconnected` only in that state), the user stream's one-shot
+    /// end-marker ([`Received::UserLaneClosed`]) is delivered through the same
+    /// path a user item takes: control keeps its priority over it, aging
+    /// forces it through exactly as for users, and it resets the streak.
     pub async fn recv(&mut self) -> Option<Received<C, U>> {
+        // The end-marker takes a user slot: it resets the aging streak
+        // exactly as a user item would, and fires at most once.
+        macro_rules! take_leg {
+            () => {{
+                self.usr_closed_reported = true;
+                self.consec_control = 0;
+                return Some(Received::UserLaneClosed);
+            }};
+        }
         loop {
             // Aging safety net: after K back-to-back controls, let one user
-            // through if one is waiting.
+            // through if one is waiting. The end-marker is forced through
+            // here exactly as a user item.
             if self.aging_cap != 0 && self.consec_control >= self.aging_cap {
                 match self.urx.try_recv() {
                     Ok(u) => {
@@ -199,6 +225,9 @@ impl<C, U> Consumer<C, U> {
                     }
                     Err(flume::TryRecvError::Disconnected) => self.usr_closed = true,
                     Err(flume::TryRecvError::Empty) => {}
+                }
+                if self.usr_closed && !self.usr_closed_reported {
+                    take_leg!();
                 }
             }
 
@@ -212,7 +241,8 @@ impl<C, U> Consumer<C, U> {
                 Err(flume::TryRecvError::Empty) => {}
             }
 
-            // Control empty: serve a ready user.
+            // Control empty: serve a ready user — or its end-marker once the
+            // lane is terminally closed and drained.
             match self.urx.try_recv() {
                 Ok(u) => {
                     self.consec_control = 0;
@@ -221,6 +251,9 @@ impl<C, U> Consumer<C, U> {
                 Err(flume::TryRecvError::Disconnected) => self.usr_closed = true,
                 Err(flume::TryRecvError::Empty) => {}
             }
+            if self.usr_closed && !self.usr_closed_reported {
+                take_leg!();
+            }
 
             if self.ctl_closed && self.usr_closed {
                 return None;
@@ -228,7 +261,9 @@ impl<C, U> Consumer<C, U> {
 
             // Both lanes momentarily empty: park until either delivers. `biased`
             // keeps control preferred if both wake together; flume's
-            // `recv_async` provides the wakeup (P5) and disconnect signal.
+            // `recv_async` provides the wakeup (P5) and disconnect signal —
+            // a last-sender drop wakes the parked select, and the loop above
+            // then delivers the end-marker.
             tokio::select! {
                 biased;
                 c = self.crx.recv_async(), if !self.ctl_closed => match c {
@@ -239,6 +274,28 @@ impl<C, U> Consumer<C, U> {
                     Ok(u) => { self.consec_control = 0; return Some(Received::User(u)); }
                     Err(_) => self.usr_closed = true,
                 },
+            }
+        }
+    }
+
+    /// Receive the next CONTROL item only, never consuming the user lane.
+    /// `None` once the control lane is closed and drained. Cancel-safe under
+    /// the same registration protocol as `recv`; here the lanes are
+    /// independent flume channels, so a user-lane push cannot even cause a
+    /// spurious wake — and no user item is ever consumed. The aging streak
+    /// (`consec_control`) is untouched by this path.
+    pub async fn recv_control(&mut self) -> Option<C> {
+        if self.ctl_closed {
+            return None;
+        }
+        // flume's `recv_async` yields every queued item before reporting
+        // disconnection, so this single await IS the closed-and-drained
+        // sweep `recv` documents for the both-closed path.
+        match self.crx.recv_async().await {
+            Ok(c) => Some(c),
+            Err(flume::RecvError::Disconnected) => {
+                self.ctl_closed = true;
+                None
             }
         }
     }
@@ -270,6 +327,7 @@ pub fn channel<C, U>(cfg: Config) -> (ControlSender<C>, UserSender<U>, Consumer<
             consec_control: 0,
             ctl_closed: false,
             usr_closed: false,
+            usr_closed_reported: false,
             _marker: PhantomData,
         },
     )

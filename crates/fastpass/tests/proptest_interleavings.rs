@@ -22,23 +22,50 @@ const GUARD: Duration = Duration::from_secs(10);
 /// The documented dequeue policy, modeled exactly: control-first, with one
 /// waiting user forced through after every `k` consecutive control dequeues.
 /// Mirrors `Consumer::recv` including the guarded streak increment (streak
-/// never exceeds `k`).
+/// never exceeds `k`) and, since the lane-lifecycle addition, the one-shot
+/// `UserLaneClosed` end-marker: the senders are dropped before the drain
+/// starts, so the marker is deliverable wherever the policy next serves a
+/// user with an empty user queue — the aging slot (streak at `k`) or the
+/// control-empty slot — and it resets the streak like a user item.
 fn model(users: &mut VecDeque<u32>, controls: &mut VecDeque<u32>, k: usize) -> Vec<Received<u32, u32>> {
-    let mut out = Vec::with_capacity(users.len() + controls.len());
+    let mut out = Vec::with_capacity(users.len() + controls.len() + 1);
     let mut streak = 0usize;
-    while !users.is_empty() || !controls.is_empty() {
-        if k != 0 && streak >= k && !users.is_empty() {
-            out.push(Received::User(users.pop_front().unwrap()));
-            streak = 0;
-        } else if !controls.is_empty() {
-            out.push(Received::Control(controls.pop_front().unwrap()));
+    let mut leg_pending = true; // user lane terminally closed from the start
+    loop {
+        if k != 0 && streak >= k {
+            if let Some(u) = users.pop_front() {
+                out.push(Received::User(u));
+                streak = 0;
+                continue;
+            }
+            if leg_pending {
+                out.push(Received::UserLaneClosed);
+                leg_pending = false;
+                streak = 0;
+                continue;
+            }
+            // Aging pop came up empty and the marker is spent: fall through
+            // to control with the streak pinned at the cap.
+        }
+        if let Some(c) = controls.pop_front() {
+            out.push(Received::Control(c));
             if k != 0 && streak < k {
                 streak += 1;
             }
-        } else {
-            out.push(Received::User(users.pop_front().unwrap()));
-            streak = 0;
+            continue;
         }
+        if let Some(u) = users.pop_front() {
+            out.push(Received::User(u));
+            streak = 0;
+            continue;
+        }
+        if leg_pending {
+            out.push(Received::UserLaneClosed);
+            leg_pending = false;
+            streak = 0;
+            continue;
+        }
+        break;
     }
     out
 }
@@ -121,14 +148,20 @@ proptest! {
 
             let mut got_c = Vec::new();
             let mut got_u = Vec::new();
+            let mut legs = 0u32;
             loop {
                 match tokio::time::timeout(GUARD, rx.recv()).await.expect("recv stalled") {
                     Some(Received::Control(c)) => got_c.push(c),
                     Some(Received::User(u)) => got_u.push(u),
+                    // End-marker: deliverable once the producers' senders
+                    // drop with the ring drained; at most once per channel.
+                    Some(Received::UserLaneClosed) => legs += 1,
                     None => break,
                 }
             }
             producers.await.unwrap();
+
+            prop_assert!(legs <= 1, "UserLaneClosed fired {legs}x — must be at most once");
 
             prop_assert_eq!(
                 got_c,
