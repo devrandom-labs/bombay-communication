@@ -59,7 +59,11 @@ fn drain_throughput(c: &mut Criterion) {
                 let mut n = 0u32;
                 while let Some(x) = rx.recv().await {
                     black_box(&x);
-                    n += 1;
+                    match x {
+                        // The user stream's one-shot end-marker is not an item.
+                        Received::UserLaneClosed => {}
+                        Received::Control(_) | Received::User(_) => n += 1,
+                    }
                 }
                 assert_eq!(n, DRAIN_ITEMS_PER_LANE * 2);
             },
@@ -198,7 +202,11 @@ fn producer_contention(c: &mut Criterion) {
             let mut n = 0u32;
             while let Some(x) = rx.recv().await {
                 black_box(&x);
-                n += 1;
+                match x {
+                    // The user stream's one-shot end-marker is not an item.
+                    Received::UserLaneClosed => {}
+                    Received::Control(_) | Received::User(_) => n += 1,
+                }
             }
             assert_eq!(n, CONTENTION_ITEMS_PER_LANE * 4);
             for h in handles {
