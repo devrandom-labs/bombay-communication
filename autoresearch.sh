@@ -6,8 +6,18 @@
 # lanes of the current design and reports throughput plus control-latency-under-
 # backlog.
 #
-# Primary metric:   score            = throughput / control_latency_ns  (MAXIMIZE)
-# Secondary metrics: throughput_ops, control_latency_ns (parsed from the perf bin).
+# Primary metric:   score — the composite from .auto/measure.sh (best-of-3,
+#                   normalized-min vs .auto/PERF_BASELINE with per-metric floors
+#                   once the UserAnchor contract lands; 0 while the contract is
+#                   pending, because the perf harness does not emit the
+#                   contract workload lines yet). MAXIMIZE.
+#
+# Secondary metrics: direct_throughput_ops, anchor_throughput_ops,
+#                   anchor_overhead_ns, control_latency_ns, drain_throughput_ops
+#                   (contract surface, from measure.sh's echoed perf lines);
+#                   throughput_ops, control_latency_ns (legacy surface, reported
+#                   only while the contract is pending — measure.sh cannot parse
+#                   the legacy line names).
 #
 # Determinism: fixed perf workload, no network, no time-of-day dependence.
 # A compile/runtime failure makes measure.sh emit METRIC score=0, which passes
@@ -44,10 +54,33 @@ if [ -z "${score}" ]; then
 	exit 1
 fi
 
-thr=$(printf '%s\n' "$out" | grep -oE 'throughput_ops=[0-9.]+' | head -n1 | cut -d= -f2)
-lat=$(printf '%s\n' "$out" | grep -oE 'control_latency_ns=[0-9.]+' | head -n1 | cut -d= -f2)
-
 echo "METRIC score=${score}"
-[ -n "${thr}" ] && echo "METRIC throughput_ops=${thr}"
-[ -n "${lat}" ] && echo "METRIC control_latency_ns=${lat}"
+
+# Contract-surface secondaries (present once fastpass-perf emits the
+# UserAnchor workload lines; measure.sh echoes them verbatim).
+while IFS=: read -r src dst; do
+	val=$(printf '%s\n' "$out" | sed -n "s/^${src}=//p" | head -n1)
+	[ -n "${val}" ] && echo "METRIC ${dst}=${val}"
+done <<'EOF'
+DIRECT_THROUGHPUT_OPS:direct_throughput_ops
+ANCHOR_THROUGHPUT_OPS:anchor_throughput_ops
+ANCHOR_OVERHEAD_NS:anchor_overhead_ns
+CONTROL_LATENCY_NS:control_latency_ns
+DRAIN_THROUGHPUT_OPS:drain_throughput_ops
+EOF
+
+# Legacy-surface fallback: while the contract is pending, measure.sh has no
+# contract lines to echo, so report the perf binary's raw legacy lines
+# directly (same fixed workload measure.sh just ran).
+if ! printf '%s\n' "$out" | grep -q '^DIRECT_THROUGHPUT_OPS='; then
+	legacy=$(./target/release/fastpass-perf 2>/dev/null || true)
+	while IFS=: read -r src dst; do
+		val=$(printf '%s\n' "${legacy}" | sed -n "s/^${src}=//p" | head -n1)
+		[ -n "${val}" ] && echo "METRIC ${dst}=${val}"
+	done <<'EOF'
+THROUGHPUT_OPS:throughput_ops
+CONTROL_LATENCY_NS:control_latency_ns
+EOF
+fi
+
 exit 0
