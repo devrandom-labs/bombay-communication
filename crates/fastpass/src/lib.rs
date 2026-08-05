@@ -35,9 +35,9 @@ use std::fmt;
 use std::mem::MaybeUninit;
 
 #[cfg(not(loom))]
-use std::sync::Arc;
-#[cfg(not(loom))]
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+#[cfg(not(loom))]
+use std::sync::{Arc, Weak};
 
 #[cfg(loom)]
 use loom::sync::Arc;
@@ -924,6 +924,111 @@ impl<U> UserSender<U> {
             Err(v) => Err(TrySendError::Full(v)),
         }
     }
+
+    /// Derive a non-owning anchor from this sender (actorpass address-table
+    /// endpoint). The anchor holds no liveness: the lane closes when the
+    /// last counting `UserSender` drops even while anchors are held.
+    #[must_use]
+    pub fn anchor(&self) -> UserAnchor<U> {
+        #[cfg(not(loom))]
+        let lane = Arc::downgrade(&self.lane);
+        #[cfg(loom)]
+        let lane = self.lane.clone();
+        UserAnchor { lane }
+    }
+}
+
+/// Non-owning weak capability to the user lane (actorpass address-table
+/// endpoint). Holds no liveness: the lane closes when the last counting
+/// [`UserSender`] drops even while anchors are held. Every delivery first
+/// atomically acquires a temporary live [`UserSender`], so a delivery racing
+/// the last sender drop either linearizes entirely before `UserLaneClosed`
+/// or fails with its payload entirely after.
+///
+/// Under `cfg(loom)` the anchor holds a strong `Arc` instead of a `Weak`
+/// (loom's `Arc` has no `downgrade`): the semantic liveness is governed by
+/// the `senders` counter, NOT the strong count, so the model stays faithful
+/// — the strong-ref distinction is pure memory reclamation, covered on
+/// hardware by `tests/leak.rs`.
+#[derive(Clone)]
+pub struct UserAnchor<U> {
+    #[cfg(not(loom))]
+    lane: Weak<UserLane<U>>,
+    #[cfg(loom)]
+    lane: Arc<UserLane<U>>,
+}
+
+impl<U> UserAnchor<U> {
+    /// Acquire a temporary live [`UserSender`] iff the lane is still open.
+    ///
+    /// The liveness increment is CONDITIONAL and atomic — one read-modify-
+    /// write loop over the live-sender count that succeeds only while the
+    /// count is nonzero. It never increments zero, so it can never resurrect
+    /// a closed lane; a last-sender drop racing this upgrade is caught by
+    /// the RMW reading zero, and the upgrade then fails with no side effect.
+    /// The returned sender counts as live until dropped — held across an
+    /// async send, released on success, error, or cancellation.
+    #[must_use]
+    pub fn upgrade(&self) -> Option<UserSender<U>> {
+        // Strong ref first: the consumer or another sender keeps the lane
+        // alive. Then the conditional RMW gates on the live-sender count —
+        // the `Weak` step only fails once the lane is fully reclaimed.
+        #[cfg(not(loom))]
+        let lane = self.lane.upgrade()?;
+        #[cfg(loom)]
+        let lane = self.lane.clone();
+        lane.senders
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                // Conditional: succeed only while the count is nonzero — a
+                // zero count is terminal (the lane is closed) and must never
+                // be incremented, or the anchor would resurrect the lane.
+                if n == 0 { None } else { n.checked_add(1) }
+            })
+            .ok()?;
+        Some(UserSender { lane })
+    }
+
+    /// Enqueue a user message through a temporary live sender, awaiting
+    /// capacity (backpressure). The temporary sender stays alive across the
+    /// await — the lane cannot close while the delivery is in flight — and
+    /// is dropped on success, error, or future cancellation, releasing its
+    /// temporary liveness.
+    ///
+    /// # Errors
+    /// Returns [`UserClosed`] carrying `item` if the lane is closed (no
+    /// live counting sender, or the consumer is gone).
+    #[cfg(not(loom))]
+    pub async fn send(&self, item: U) -> Result<(), UserClosed<U>> {
+        let Some(sender) = self.upgrade() else {
+            return Err(UserClosed(item));
+        };
+        sender.send(item).await
+    }
+
+    /// Blocking twin of `send`, compiled ONLY under `cfg(loom)` — drives the
+    /// anchor loom models in `tests/loom.rs`.
+    #[cfg(loom)]
+    #[doc(hidden)]
+    pub fn send_blocking(&self, item: U) -> Result<(), UserClosed<U>> {
+        let Some(sender) = self.upgrade() else {
+            return Err(UserClosed(item));
+        };
+        sender.send_blocking(item)
+    }
+
+    /// Enqueue a user message without blocking, through a temporary live
+    /// sender.
+    ///
+    /// # Errors
+    /// [`TrySendError::Closed`] carrying `item` if the lane is closed (no
+    /// live counting sender, or the consumer is gone);
+    /// [`TrySendError::Full`] if the lane is at capacity.
+    pub fn try_send(&self, item: U) -> Result<(), TrySendError<U>> {
+        let Some(sender) = self.upgrade() else {
+            return Err(TrySendError::Closed(item));
+        };
+        sender.try_send(item)
+    }
 }
 
 /// Pop the next published control in ticket order, advancing the consumer's
@@ -1069,7 +1174,20 @@ impl<C, U> Consumer<C, U> {
             () => {
                 match usr.pop() {
                     Some(u) => take_user!(u),
-                    None if !*leg_reported && usr.closed() => take_leg!(),
+                    None if !*leg_reported && usr.closed() => {
+                        // The `closed()` read (Acquire) synchronizes with
+                        // the last sender's `fetch_sub(Release)`, so every
+                        // item published before that decrement is visible
+                        // now — re-pop once before declaring the end-marker,
+                        // so a delivery racing the last drop cannot publish
+                        // an item AFTER it. A zero sender count is terminal
+                        // (the anchor's conditional increment refuses it), so
+                        // one re-pop exhausts the possibilities.
+                        match usr.pop() {
+                            Some(u) => take_user!(u),
+                            None => take_leg!(),
+                        }
+                    }
                     None => {}
                 }
             };
@@ -1132,9 +1250,17 @@ impl<C, U> Consumer<C, U> {
                 // The leg must be observable from the PARKED path too: the
                 // last-sender drop wakes this registration, and the
                 // re-check delivers the end-marker instead of parking on a
-                // dead user lane.
+                // dead user lane. Same re-pop discipline as
+                // `pop_user_or_leg!`: the `closed()` read (Acquire)
+                // synchronizes with the last sender's `fetch_sub(Release)`,
+                // so an item published before that decrement is visible now
+                // — re-pop once so a delivery racing the drop cannot land
+                // an item AFTER the end-marker.
                 None if !*leg_reported && usr.closed() => {
                     core.parked.store(false, Ordering::Relaxed);
+                    if let Some(u) = usr.pop() {
+                        take_user!(u);
+                    }
                     take_leg!();
                 }
                 None => {}
@@ -1193,7 +1319,20 @@ impl<C, U> Consumer<C, U> {
             () => {
                 match usr.pop() {
                     Some(u) => take_user!(u),
-                    None if !*leg_reported && usr.closed() => take_leg!(),
+                    None if !*leg_reported && usr.closed() => {
+                        // The `closed()` read (Acquire) synchronizes with
+                        // the last sender's `fetch_sub(Release)`, so every
+                        // item published before that decrement is visible
+                        // now — re-pop once before declaring the end-marker,
+                        // so a delivery racing the last drop cannot publish
+                        // an item AFTER it. A zero sender count is terminal
+                        // (the anchor's conditional increment refuses it), so
+                        // one re-pop exhausts the possibilities.
+                        match usr.pop() {
+                            Some(u) => take_user!(u),
+                            None => take_leg!(),
+                        }
+                    }
                     None => {}
                 }
             };
@@ -1246,8 +1385,16 @@ impl<C, U> Consumer<C, U> {
                     core.parked.store(false, Ordering::Relaxed);
                     take_user!(u);
                 }
+                // The leg must be observable from the PARKED path too: the
+                // last-sender drop wakes this registration, and the
+                // re-check delivers the end-marker instead of parking on a
+                // dead user lane. Same re-pop discipline as
+                // `pop_user_or_leg!` (see the async `recv`).
                 None if !*leg_reported && usr.closed() => {
                     core.parked.store(false, Ordering::Relaxed);
+                    if let Some(u) = usr.pop() {
+                        take_user!(u);
+                    }
                     take_leg!();
                 }
                 None => {}

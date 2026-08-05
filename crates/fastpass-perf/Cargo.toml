@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 fastpass = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync"] }
 
 [lints]
 workspace = true

@@ -41,7 +41,7 @@ macro_rules! property_suite {
             use ::std::time::Duration;
             use ::tokio::sync::Barrier;
             use ::tokio::time::timeout;
-            use $fp::{Config, Received, channel};
+            use $fp::{Config, Received, TrySendError, UserClosed, channel};
 
             const GUARD: Duration = Duration::from_secs(5);
 
@@ -487,6 +487,110 @@ macro_rules! property_suite {
                     "closed empty control lane must yield None"
                 );
             }
+
+            // ——— UserAnchor (actorpass address-table endpoint, card 3) ———
+
+            // Anchor clone/drop neutrality: cloned anchors (the address-table
+            // shape) must not keep the user lane open — the end-marker fires
+            // and `recv` drains to `None` while they are held.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn anchor_shared_clone_neutrality() {
+                let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(8));
+                let a1 = usr.anchor();
+                let a2 = a1.clone();
+                usr.try_send(1).unwrap();
+                drop(usr);
+                assert!(matches!(recv1(&mut rx).await, Received::User(1)));
+                assert!(
+                    matches!(recv1(&mut rx).await, Received::UserLaneClosed),
+                    "the leg must fire with only anchors held"
+                );
+                // The control lane continues to work past the marker.
+                ctl.send(7).unwrap();
+                assert!(matches!(recv1(&mut rx).await, Received::Control(7)));
+                drop(ctl);
+                assert!(
+                    timeout(GUARD, rx.recv())
+                        .await
+                        .expect("recv stalled")
+                        .is_none(),
+                    "recv must return None once both lanes are closed and drained"
+                );
+                drop((a1, a2));
+            }
+
+            // A live anchor upgrades and delivers while a counting sender
+            // lives — both through `upgrade` + the sender ops and through
+            // the anchor's own `try_send`.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn anchor_shared_upgrade_and_send_while_live() {
+                let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(8));
+                let anchor = usr.anchor();
+                let upgraded = anchor.upgrade().expect("sender is live");
+                upgraded.try_send(11).unwrap();
+                drop(upgraded);
+                assert!(matches!(recv1(&mut rx).await, Received::User(11)));
+                anchor.try_send(12).unwrap();
+                assert!(matches!(recv1(&mut rx).await, Received::User(12)));
+                drop(usr);
+                drop(ctl);
+            }
+
+            // After the last counting sender drops: `upgrade` returns `None`,
+            // and `send`/`try_send` return the ORIGINAL payload as closed.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn anchor_shared_fails_after_last_sender() {
+                let (_ctl, usr, mut rx) = channel::<u32, u32>(Config::new(8));
+                let anchor = usr.anchor();
+                drop(usr);
+                assert!(
+                    matches!(recv1(&mut rx).await, Received::UserLaneClosed),
+                    "the leg must fire after the last sender drops"
+                );
+                assert!(
+                    anchor.upgrade().is_none(),
+                    "upgrade succeeded after the lane closed"
+                );
+                match anchor.try_send(99) {
+                    Err(TrySendError::Closed(v)) => assert_eq!(v, 99, "payload mangled"),
+                    Err(TrySendError::Full(v)) => {
+                        panic!("closed lane reported Full({v}) — must be Closed")
+                    }
+                    Ok(()) => panic!("try_send succeeded after the lane closed"),
+                }
+                let err = timeout(GUARD, anchor.send(100))
+                    .await
+                    .expect("anchor send stalled")
+                    .expect_err("send succeeded after the lane closed");
+                match err {
+                    UserClosed(v) => assert_eq!(v, 100, "payload mangled"),
+                }
+            }
+
+            // Anchors fail once the CONSUMER is dropped (never resurrect a
+            // lane): delivery reports the payload back as closed, and once
+            // the senders are also gone the anchor is permanently dead.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn anchor_shared_fails_after_consumer_drop() {
+                let (ctl, usr, rx) = channel::<u32, u32>(Config::new(8));
+                let anchor = usr.anchor();
+                drop(rx); // consumer gone
+                match anchor.try_send(7) {
+                    Err(TrySendError::Closed(v)) => assert_eq!(v, 7, "payload mangled"),
+                    Err(TrySendError::Full(v)) => {
+                        panic!("dropped consumer reported Full({v}) — must be Closed")
+                    }
+                    Ok(()) => panic!("try_send succeeded after the consumer dropped"),
+                }
+                // Never resurrects: with the senders gone too, the anchor is
+                // dead for good.
+                drop(usr);
+                drop(ctl);
+                assert!(
+                    anchor.upgrade().is_none(),
+                    "upgrade resurrected a lane with no counting sender"
+                );
+            }
         }
     };
 }
@@ -542,6 +646,37 @@ macro_rules! alloc_guard {
                 usr.try_send(42).unwrap();
                 let delta = ALLOCS.load(Ordering::Relaxed) - before;
                 assert_eq!(delta, 0, "steady-state user send allocated {delta}x (P7)");
+            }
+
+            // Card-3 gate 8 — anchor steady-state `try_send` must not
+            // allocate: the upgrade is a conditional RMW over the live-sender
+            // count (plus, in the optimized crate, a `Weak` bump), and the
+            // push goes into the warm ring. Same warm-then-measure discipline
+            // as P7.
+            #[test]
+            fn anchor_try_send_steady_state_is_zero_alloc() {
+                let (_ctl, usr, mut rx) = channel::<u32, u32>(Config::new(8));
+                let anchor = usr.anchor();
+                for i in 0..8u32 {
+                    usr.try_send(i).unwrap();
+                }
+                let rt = ::tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    for _ in 0..8 {
+                        let _ = rx.recv().await;
+                    }
+                });
+
+                let before = ALLOCS.load(Ordering::Relaxed);
+                anchor.try_send(42).unwrap();
+                let delta = ALLOCS.load(Ordering::Relaxed) - before;
+                assert_eq!(
+                    delta, 0,
+                    "steady-state anchor try_send allocated {delta}x (card-3 gate 8)"
+                );
             }
         }
     };

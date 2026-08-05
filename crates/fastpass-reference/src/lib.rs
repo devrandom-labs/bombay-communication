@@ -178,6 +178,69 @@ impl<U> UserSender<U> {
             flume::TrySendError::Disconnected(v) => TrySendError::Closed(v),
         })
     }
+
+    /// Derive a non-owning anchor from this sender (actorpass address-table
+    /// endpoint). The anchor holds no liveness: the lane closes when the
+    /// last counting `UserSender` drops even while anchors are held.
+    #[must_use]
+    pub fn anchor(&self) -> UserAnchor<U> {
+        UserAnchor {
+            tx: self.tx.downgrade(),
+        }
+    }
+}
+
+/// Non-owning weak capability to the user lane. Holds no liveness: the lane
+/// closes when the last counting [`UserSender`] drops even while anchors are
+/// held. A delivery first upgrades to a temporary live sender, so a delivery
+/// racing the last sender drop either linearizes entirely before
+/// `UserLaneClosed` or fails with its payload entirely after.
+#[derive(Clone)]
+pub struct UserAnchor<U> {
+    tx: flume::WeakSender<U>,
+}
+
+impl<U> UserAnchor<U> {
+    /// Acquire a temporary live [`UserSender`] iff the lane is still open.
+    /// The liveness increment is CONDITIONAL and atomic (one RMW loop over
+    /// flume's sender count): it succeeds only while a counting sender is
+    /// live, so it can never resurrect a closed lane. The returned sender
+    /// counts as live until dropped — held across an async send, released
+    /// on success, error, or cancellation.
+    #[must_use]
+    pub fn upgrade(&self) -> Option<UserSender<U>> {
+        self.tx.upgrade().map(|tx| UserSender { tx })
+    }
+
+    /// Enqueue a user message through a temporary live sender, awaiting
+    /// capacity (backpressure). The temporary sender stays alive across the
+    /// await — the lane cannot close while the delivery is in flight — and
+    /// is dropped on success, error, or future cancellation, releasing its
+    /// temporary liveness.
+    ///
+    /// # Errors
+    /// Returns [`UserClosed`] carrying `item` if the lane is closed (no
+    /// live counting sender, or the consumer is gone).
+    pub async fn send(&self, item: U) -> Result<(), UserClosed<U>> {
+        let Some(sender) = self.upgrade() else {
+            return Err(UserClosed(item));
+        };
+        sender.send(item).await
+    }
+
+    /// Enqueue a user message without blocking, through a temporary live
+    /// sender.
+    ///
+    /// # Errors
+    /// [`TrySendError::Closed`] carrying `item` if the lane is closed (no
+    /// live counting sender, or the consumer is gone);
+    /// [`TrySendError::Full`] if the lane is at capacity.
+    pub fn try_send(&self, item: U) -> Result<(), TrySendError<U>> {
+        let Some(sender) = self.upgrade() else {
+            return Err(TrySendError::Closed(item));
+        };
+        sender.try_send(item)
+    }
 }
 
 /// The single consumer. Serves control ahead of user, with an aging safety net.

@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc f582b9ce8d6879461ac1c34e05cb1f9e27e290ecf965ac4ef1094963572f2c32 # shrinks to k = 0, users = [0], controls = [0]
+cc ac5155870da633830ddda5aa0a14923f7b1bb783adf846dff1f547093b5c7e2e # shrinks to ops = [DropLastSender, AnchorSend(0)]

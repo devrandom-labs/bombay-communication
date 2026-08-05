@@ -16,7 +16,7 @@
 //!    the end-marker is read, control is read via `recv_control`, then the
 //!    control lane dies and `recv_control` returns `None`.
 
-use fastpass::{Config, Received, channel};
+use fastpass::{Config, Received, TrySendError, UserClosed, channel};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Barrier;
@@ -178,4 +178,264 @@ async fn parked_for_restart_shape() {
             .expect("recv stalled")
             .is_none()
     );
+}
+
+// ——— UserAnchor: the non-owning address-table endpoint (card 3) ———
+//
+// The anchor holds no liveness. Every delivery first atomically acquires a
+// temporary live `UserSender`; a delivery racing the last sender drop either
+// linearizes entirely before `UserLaneClosed` or fails with its payload
+// entirely after. These SUT tests pin the lifecycle on the optimized crate;
+// the shared suite in fastpass-testkit runs the same shape against both
+// implementations.
+
+/// Cloned anchors (the address-table shape) do not delay `UserLaneClosed` or
+/// the final `recv() -> None`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchor_clone_does_not_hold_lane_open() {
+    let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(8));
+    let a1 = usr.anchor();
+    let a2 = a1.clone();
+    let a3 = a1.clone();
+    usr.try_send(1).unwrap();
+    drop(usr);
+    assert!(matches!(
+        timeout(GUARD, rx.recv()).await.expect("recv stalled"),
+        Some(Received::User(1))
+    ));
+    assert!(
+        matches!(
+            timeout(GUARD, rx.recv()).await.expect("recv stalled"),
+            Some(Received::UserLaneClosed)
+        ),
+        "the end-marker must fire while cloned anchors are still held"
+    );
+    drop(ctl);
+    assert!(
+        timeout(GUARD, rx.recv())
+            .await
+            .expect("recv stalled")
+            .is_none(),
+        "recv must drain to None while cloned anchors are still held"
+    );
+    drop((a1, a2, a3));
+}
+
+/// An anchor upgrades and delivers while at least one counting sender is
+/// live — through `upgrade`, through `send`, and through `try_send`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchor_send_while_live() {
+    let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(8));
+    let anchor = usr.anchor();
+    let upgraded = anchor.upgrade().expect("a counting sender is live");
+    upgraded.try_send(10).unwrap();
+    drop(upgraded);
+    anchor.try_send(11).unwrap();
+    anchor.send(12).await.unwrap();
+    drop(usr);
+    drop(ctl);
+
+    let mut users = Vec::new();
+    while let Some(x) = timeout(GUARD, rx.recv()).await.expect("recv stalled") {
+        if let Received::User(u) = x {
+            users.push(u);
+        }
+    }
+    assert_eq!(
+        users,
+        vec![10, 11, 12],
+        "anchor deliveries must arrive in FIFO order"
+    );
+}
+
+/// After the last counting sender drops: `upgrade` returns `None`; `send`
+/// and `try_send` return the ORIGINAL payload as closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchor_fails_after_last_sender() {
+    let (_ctl, usr, mut rx) = channel::<u32, u32>(Config::new(8));
+    let anchor = usr.anchor();
+    drop(usr);
+    assert!(matches!(
+        timeout(GUARD, rx.recv()).await.expect("recv stalled"),
+        Some(Received::UserLaneClosed)
+    ));
+    assert!(
+        anchor.upgrade().is_none(),
+        "upgrade resurrected a closed lane"
+    );
+    match anchor.try_send(99) {
+        Err(TrySendError::Closed(v)) => assert_eq!(v, 99, "payload mangled"),
+        Err(TrySendError::Full(v)) => panic!("closed lane reported Full({v})"),
+        Ok(()) => panic!("try_send succeeded after closure"),
+    }
+    match timeout(GUARD, anchor.send(100))
+        .await
+        .expect("anchor send stalled")
+    {
+        Err(UserClosed(v)) => assert_eq!(v, 100, "payload mangled"),
+        Ok(()) => panic!("send succeeded after closure"),
+    }
+}
+
+/// Anchors fail once the CONSUMER is dropped and never resurrect a lane.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchor_fails_after_consumer_drop() {
+    let (ctl, usr, rx) = channel::<u32, u32>(Config::new(8));
+    let anchor = usr.anchor();
+    drop(rx);
+    match anchor.try_send(7) {
+        Err(TrySendError::Closed(v)) => assert_eq!(v, 7, "payload mangled"),
+        Err(TrySendError::Full(v)) => panic!("dropped consumer reported Full({v})"),
+        Ok(()) => panic!("try_send succeeded after the consumer dropped"),
+    }
+    drop(usr);
+    drop(ctl);
+    assert!(
+        anchor.upgrade().is_none(),
+        "upgrade resurrected a dead lane"
+    );
+}
+
+/// A blocked anchor `send` counts as live until it completes or is
+/// cancelled: closure cannot overtake an acquired delivery (gate 5). The
+/// stream must be 0, 1, the blocked item, THEN the end-marker — never the
+/// marker before the in-flight delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_anchor_send_holds_lane_open() {
+    let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(2));
+    let anchor = usr.anchor();
+    usr.try_send(0).unwrap();
+    usr.try_send(1).unwrap(); // ring FULL
+    let handle = tokio::spawn({
+        let anchor = anchor.clone();
+        async move { anchor.send(2).await }
+    });
+    // Let the anchor send park on the full ring, then drop the last
+    // counting sender: the blocked delivery still owns liveness.
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    drop(usr);
+
+    assert!(matches!(
+        timeout(GUARD, rx.recv()).await.expect("recv stalled"),
+        Some(Received::User(0))
+    ));
+    assert!(matches!(
+        timeout(GUARD, rx.recv()).await.expect("recv stalled"),
+        Some(Received::User(1))
+    ));
+    // The consumer's pre-park release wakes the blocked send; its item
+    // arrives BEFORE the end-marker — closure cannot overtake the delivery.
+    assert!(matches!(
+        timeout(GUARD, rx.recv()).await.expect("recv stalled"),
+        Some(Received::User(2))
+    ));
+    assert!(
+        matches!(
+            timeout(GUARD, rx.recv()).await.expect("recv stalled"),
+            Some(Received::UserLaneClosed)
+        ),
+        "the end-marker must wait for the in-flight delivery (gate 5)"
+    );
+    handle.await.unwrap().expect("blocked send resolves");
+    drop(ctl);
+    assert!(
+        timeout(GUARD, rx.recv())
+            .await
+            .expect("recv stalled")
+            .is_none()
+    );
+}
+
+/// Cancelling a blocked anchor send releases its temporary liveness count
+/// (gate 6): the lane can then close normally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_anchor_send_releases_liveness() {
+    let (_ctl, usr, mut rx) = channel::<u32, u32>(Config::new(2));
+    let anchor = usr.anchor();
+    usr.try_send(0).unwrap();
+    usr.try_send(1).unwrap(); // ring FULL
+    let handle = tokio::spawn({
+        let anchor = anchor.clone();
+        async move { anchor.send(2).await }
+    });
+    // Let the send park on the full ring, then CANCEL it: the temporary
+    // sender is dropped with the future, releasing its liveness.
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    handle.abort();
+
+    drop(usr); // last counting sender — the cancelled send must not hold the lane
+    assert!(matches!(
+        timeout(GUARD, rx.recv()).await.expect("recv stalled"),
+        Some(Received::User(0))
+    ));
+    assert!(matches!(
+        timeout(GUARD, rx.recv()).await.expect("recv stalled"),
+        Some(Received::User(1))
+    ));
+    assert!(
+        matches!(
+            timeout(GUARD, rx.recv()).await.expect("recv stalled"),
+            Some(Received::UserLaneClosed)
+        ),
+        "the lane never closed — the cancelled send leaked its liveness (gate 6)"
+    );
+}
+
+/// A last-sender-drop racing an anchor delivery has exactly two legal
+/// outcomes (gate 4): the item precedes `UserLaneClosed`, or delivery fails
+/// and no item appears. An item after the marker is forbidden.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn anchor_racing_last_drop_is_linearizable() {
+    for round in 0..300u32 {
+        let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(8));
+        let anchor = usr.anchor();
+        let b = Arc::new(Barrier::new(3));
+        let b2 = b.clone();
+        let b3 = b.clone();
+        let dropper = tokio::spawn(async move {
+            b2.wait().await;
+            drop(usr);
+        });
+        let sender = tokio::spawn(async move {
+            b3.wait().await;
+            anchor.try_send(round)
+        });
+        b.wait().await;
+        let result = sender.await.unwrap();
+        dropper.await.unwrap();
+
+        // Drain the user stream; track the marker position.
+        drop(ctl);
+        let mut saw_user = false;
+        let mut marker_seen = false;
+        loop {
+            match timeout(GUARD, rx.recv()).await.expect("recv stalled") {
+                Some(Received::User(u)) => {
+                    assert_eq!(u, round, "foreign item in the stream");
+                    assert!(
+                        !marker_seen,
+                        "user item after UserLaneClosed — marker ordering broken"
+                    );
+                    saw_user = true;
+                }
+                Some(Received::UserLaneClosed) => marker_seen = true,
+                Some(Received::Control(_)) => unreachable!("no control traffic"),
+                None => break,
+            }
+        }
+        assert!(
+            marker_seen,
+            "the end-marker must fire after the last sender drops"
+        );
+        match result {
+            Ok(()) => assert!(saw_user, "try_send Ok but no item arrived"),
+            Err(TrySendError::Full(_)) => {
+                panic!("unexpected Full on an 8-slot ring with one item")
+            }
+            Err(TrySendError::Closed(v)) => {
+                assert_eq!(v, round, "closed error must carry the original payload");
+                assert!(!saw_user, "try_send Closed but an item arrived");
+            }
+        }
+    }
 }

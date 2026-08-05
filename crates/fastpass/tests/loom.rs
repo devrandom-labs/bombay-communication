@@ -16,7 +16,11 @@
 //! termination (no lost wakeup / no hang — loom fails a deadlocked
 //! schedule), no loss, no duplication, per-lane FIFO, the
 //! `UserLaneClosed` end-marker's exactly-once latch, and `recv_control`'s
-//! park/wake discipline with a saturated user ring. The control block
+//! park/wake discipline with a saturated user ring. The card-3 `UserAnchor`
+//! models (F–H) check the conditional-increment counter protocol itself:
+//! upgrade-vs-last-drop linearizability and marker ordering (F), a blocked
+//! anchor send holding liveness until its item lands (G), and the RAII
+//! release of an upgrade dropped without delivery (H). The control block
 //! size is 2 slots under loom so tiny models cross block boundaries
 //! (linking, hint advance, consumer reclamation).
 //!
@@ -198,5 +202,191 @@ fn recv_control_parking_preserves_user_lane() {
             "recv_control consumed or reordered user items"
         );
         assert_eq!(legs, 1, "UserLaneClosed must fire exactly once");
+    });
+}
+
+#[test]
+fn anchor_upgrade_vs_last_drop() {
+    // F — the load-bearing card-3 race: an anchor `upgrade` racing the last
+    // `UserSender` drop, over the REAL conditional-increment counter
+    // protocol. Exactly two legal outcomes: the upgrade wins first and the
+    // item precedes `UserLaneClosed`, or the drop hits zero first and the
+    // upgrade fails with no item. An item AFTER the marker is forbidden.
+    // loom fails any schedule where the marker and a delivery disagree —
+    // this is the probe that kills load-then-increment, unconditional
+    // increment, and decrement-before-publication variants.
+    loom::model(|| {
+        let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(2));
+        let anchor = usr.anchor();
+        let dropper = loom::thread::spawn(move || drop(usr));
+        let upgrader = loom::thread::spawn(move || match anchor.upgrade() {
+            Some(sender) => sender.send_blocking(42).is_ok(),
+            None => false,
+        });
+        drop(ctl); // control closed from the start: the drain ends at None
+
+        let mut items = Vec::new();
+        let mut legs = 0u32;
+        let mut marker_seen = false;
+        while let Some(item) = rx.recv_blocking() {
+            match item {
+                Received::User(u) => {
+                    assert!(
+                        !marker_seen,
+                        "user item after UserLaneClosed — marker ordering broken"
+                    );
+                    items.push(u);
+                }
+                Received::UserLaneClosed => {
+                    marker_seen = true;
+                    legs += 1;
+                }
+                Received::Control(_) => unreachable!("no control traffic"),
+            }
+        }
+        let delivered = upgrader.join().unwrap();
+        dropper.join().unwrap();
+        assert_eq!(legs, 1, "UserLaneClosed must fire exactly once");
+        if delivered {
+            assert_eq!(items, vec![42], "delivered item missing from the stream");
+        } else {
+            assert!(
+                items.is_empty(),
+                "failed upgrade leaked an item into the stream"
+            );
+        }
+    });
+}
+
+#[test]
+fn anchor_blocked_send_holds_liveness() {
+    // G — a blocked anchor `send` owns temporary liveness (gate 5): with
+    // the ring full and the last counting sender dropped, the lane must NOT
+    // close; the delivery completes once a consumer pop releases it, its
+    // item lands BEFORE the end-marker, and only then does the lane close.
+    // A leaked (permanent) increment would leave the lane open forever —
+    // the drain parks and loom fails the model on the deadlock.
+    loom::model(|| {
+        let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(2));
+        let anchor = usr.anchor();
+        usr.try_send(0).expect("ring empty");
+        usr.try_send(1).expect("capacity 2");
+        let blocked = loom::thread::spawn(move || {
+            // Two legal outcomes: the upgrade wins and the delivery lands
+            // before the end-marker, or the last-sender drop wins and the
+            // payload returns as closed. Either way the lane must close.
+            match anchor.send_blocking(2) {
+                Ok(()) => true,
+                Err(_) => false,
+            }
+        });
+        drop(usr); // last counting sender — the blocked send holds liveness
+        drop(ctl);
+
+        let mut got = Vec::new();
+        let mut marker_seen = false;
+        while let Some(item) = rx.recv_blocking() {
+            match item {
+                Received::User(u) => {
+                    assert!(
+                        !marker_seen,
+                        "user item after UserLaneClosed — marker ordering broken"
+                    );
+                    got.push(u);
+                }
+                Received::UserLaneClosed => marker_seen = true,
+                Received::Control(_) => unreachable!("no control traffic"),
+            }
+        }
+        let delivered = blocked.join().unwrap();
+        assert!(
+            marker_seen,
+            "lane never closed after the send resolved — liveness leaked"
+        );
+        if delivered {
+            assert_eq!(got, [0, 1, 2], "delivered item missing from the stream");
+        } else {
+            assert_eq!(
+                got,
+                [0, 1],
+                "failed delivery leaked an item into the stream"
+            );
+        }
+    });
+}
+
+#[test]
+fn anchor_upgrade_then_drop_releases_liveness() {
+    // H — the RAII side of temporary liveness: an upgraded sender dropped
+    // WITHOUT delivering releases its increment. Whichever of the upgrade
+    // or the last drop wins, the lane must still close and the end-marker
+    // must fire exactly once. A permanent increment deadlocks the drain.
+    loom::model(|| {
+        let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(2));
+        let anchor = usr.anchor();
+        let upgrader = loom::thread::spawn(move || {
+            // The upgrade may legitimately lose to the drop; if it wins,
+            // dropping the sender without delivering must release liveness.
+            if let Some(sender) = anchor.upgrade() {
+                drop(sender);
+            }
+        });
+        drop(usr); // last counting sender
+        drop(ctl);
+        upgrader.join().unwrap();
+
+        let mut legs = 0u32;
+        while let Some(item) = rx.recv_blocking() {
+            match item {
+                Received::User(_) => unreachable!("no user traffic"),
+                Received::UserLaneClosed => legs += 1,
+                Received::Control(_) => unreachable!("no control traffic"),
+            }
+        }
+        assert_eq!(legs, 1, "UserLaneClosed must fire exactly once");
+    });
+}
+
+#[test]
+fn anchor_release_before_publish_marker_ordering() {
+    // I — the load-bearing publish-before-release program order (gate 3):
+    // a delivery must PUBLISH its item before RELEASING its temporary
+    // liveness, so the end-marker can never be delivered while the item is
+    // still unpublished. One fused thread upgrades, drops the last counting
+    // sender, and delivers (the upgrade cannot lose — the sequence is
+    // single-threaded, so the marker ordering is the ONLY thing in play);
+    // the consumer must observe the item before the end-marker. A
+    // decrement-before-publication variant fires the marker in the
+    // release→publish window and fails this model with one preemption.
+    loom::model(|| {
+        let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(2));
+        let anchor = usr.anchor();
+        let fused = loom::thread::spawn(move || {
+            let sender = anchor.upgrade().expect("sender is live");
+            drop(usr); // last counting sender — the upgraded sender holds liveness
+            sender
+                .send_blocking(42)
+                .expect("consumer alive until drained")
+        });
+        drop(ctl); // control closed from the start: the drain ends at None
+
+        let mut items = Vec::new();
+        let mut marker_seen = false;
+        while let Some(item) = rx.recv_blocking() {
+            match item {
+                Received::User(u) => {
+                    assert!(
+                        !marker_seen,
+                        "user item after UserLaneClosed — marker ordering broken"
+                    );
+                    items.push(u);
+                }
+                Received::UserLaneClosed => marker_seen = true,
+                Received::Control(_) => unreachable!("no control traffic"),
+            }
+        }
+        fused.join().unwrap();
+        assert!(marker_seen, "lane never closed");
+        assert_eq!(items, vec![42], "delivered item missing from the stream");
     });
 }
