@@ -607,6 +607,12 @@ macro_rules! alloc_guard {
 
             static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
+            // The counting allocator is process-wide, so two alloc-guard
+            // tests in this binary must not overlap — one test's measured
+            // window would absorb the other's allocations (same discipline
+            // as `tests/leak.rs`'s single-test rule).
+            static SERIAL: ::parking_lot::Mutex<()> = ::parking_lot::Mutex::new(());
+
             struct Counting;
             // SAFETY: forwards verbatim to the System allocator; the only added
             // effect is an atomic increment per allocation.
@@ -628,6 +634,7 @@ macro_rules! alloc_guard {
             // paid), then measure a single `try_send`.
             #[test]
             fn user_send_steady_state_is_zero_alloc() {
+                let _serial = SERIAL.lock();
                 let (_ctl, usr, mut rx) = channel::<u32, u32>(Config::new(8));
                 for i in 0..8u32 {
                     usr.try_send(i).unwrap();
@@ -655,6 +662,7 @@ macro_rules! alloc_guard {
             // as P7.
             #[test]
             fn anchor_try_send_steady_state_is_zero_alloc() {
+                let _serial = SERIAL.lock();
                 let (_ctl, usr, mut rx) = channel::<u32, u32>(Config::new(8));
                 let anchor = usr.anchor();
                 for i in 0..8u32 {
