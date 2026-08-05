@@ -44,7 +44,7 @@ fn main() {
     let contention = rt.block_on(anchor_contention_ops_per_sec());
     let latency_ns = rt.block_on(control_latency_ns());
     let drain = rt.block_on(drain_throughput_ops_per_sec());
-    let close_ok = rt.block_on(close_race_upgrade_ok_fraction());
+    let close_ok = close_race_upgrade_ok_fraction();
 
     let score = direct.min(anchor).min(drain) / latency_ns;
     println!("DIRECT_THROUGHPUT_OPS={direct:.0}");
@@ -145,7 +145,9 @@ async fn anchor_contention_ops_per_sec() -> f64 {
     const RING: usize = 128;
     let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(RING).with_aging_cap(1024));
     let anchor = Arc::new(usr.anchor());
-    drop(usr); // only anchors + their temporary senders remain
+    // The counting sender stays ALIVE during contention (the actorpass
+    // shape: the address endpoint anchors alongside the initial owner); it
+    // is dropped only after the producers finish, closing the lane.
 
     let b = Arc::new(Barrier::new(PRODUCERS + 1));
     let mut handles = Vec::new();
@@ -167,24 +169,46 @@ async fn anchor_contention_ops_per_sec() -> f64 {
             }
         }));
     }
+    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+    let completer = tokio::spawn(async move {
+        for h in handles {
+            let _ = h.await;
+        }
+        let _ = done_tx.send(());
+    });
+
     let start = Instant::now();
     b.wait().await;
-    drop(ctl); // control closed from the start: the drain ends at None
+    drop(ctl); // control closed from the start
     let mut n: u64 = 0;
+    // Drain as the producers push (real ring backpressure: producers park
+    // on the full ring, the consumer's pops release them). Stop when every
+    // producer's last send completed — their items are in the ring.
+    loop {
+        tokio::select! {
+            _ = &mut done_rx => break,
+            x = rx.recv() => match x {
+                Some(Received::User(_)) => {
+                    black_box(&x);
+                    n += 1;
+                }
+                Some(Received::UserLaneClosed) | None => break,
+                Some(Received::Control(_)) => unreachable!("no control traffic"),
+            },
+        }
+    }
+    drop(usr); // close the user lane
     while let Some(x) = rx.recv().await {
         match x {
             Received::User(_) => {
                 black_box(&x);
                 n += 1;
             }
-            Received::UserLaneClosed => {}
-            Received::Control(_) => unreachable!("no control traffic"),
+            _ => break,
         }
     }
     let elapsed = start.elapsed().as_secs_f64();
-    for h in handles {
-        h.await.unwrap();
-    }
+    completer.await.unwrap();
     assert_eq!(
         n,
         (PRODUCERS as u64) * u64::from(K),
@@ -259,27 +283,37 @@ async fn drain_throughput_ops_per_sec() -> f64 {
 /// Close race: repeated `upgrade` versus a racing last-sender drop. The
 /// fraction of upgrades that won is timing-dependent by construction —
 /// reported separately and excluded from the scalar score (per the card).
-async fn close_race_upgrade_ok_fraction() -> f64 {
+/// Runs on its own multi-thread runtime: on the single-thread runtime the
+/// dropper task is deterministically polled first, so the race would never
+/// exercise both outcomes.
+fn close_race_upgrade_ok_fraction() -> f64 {
     const ROUNDS: u32 = 20_000;
-    let mut ok: u32 = 0;
-    for _ in 0..ROUNDS {
-        let (_ctl, usr, _rx) = channel::<u32, u32>(Config::new(4));
-        let anchor = usr.anchor();
-        let b = Arc::new(Barrier::new(2));
-        let b2 = b.clone();
-        let dropper = tokio::spawn(async move {
-            b2.wait().await;
-            drop(usr);
-        });
-        b.wait().await;
-        if anchor.upgrade().is_some() {
-            // The temporary sender drops here, releasing its liveness.
-            ok += 1;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let mut ok: u32 = 0;
+        for _ in 0..ROUNDS {
+            let (_ctl, usr, _rx) = channel::<u32, u32>(Config::new(4));
+            let anchor = usr.anchor();
+            let b = Arc::new(Barrier::new(2));
+            let b2 = b.clone();
+            let dropper = tokio::spawn(async move {
+                b2.wait().await;
+                drop(usr);
+            });
+            b.wait().await;
+            if anchor.upgrade().is_some() {
+                // The temporary sender drops here, releasing its liveness.
+                ok += 1;
+            }
+            dropper.await.unwrap();
         }
-        dropper.await.unwrap();
-    }
-    #[allow(clippy::cast_precision_loss)]
-    {
-        f64::from(ok) / f64::from(ROUNDS)
-    }
+        #[allow(clippy::cast_precision_loss)]
+        {
+            f64::from(ok) / f64::from(ROUNDS)
+        }
+    })
 }
