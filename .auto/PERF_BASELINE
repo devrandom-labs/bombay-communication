@@ -1,0 +1,9 @@
+# Contract-landing performance baseline (card 3), recorded 2026-08-05.
+# AC power, no competing benchmark process; median of 3 direct runs of
+# ./target/release/fastpass-perf with -C target-cpu=native.
+# Consumed by .auto/measure.sh as BASE_DIRECT/BASE_ANCHOR/
+# BASE_CONTROL_LATENCY/BASE_DRAIN for normalized-min scoring with floors.
+BASE_DIRECT=176186411
+BASE_ANCHOR=143023867
+BASE_CONTROL_LATENCY=14.70
+BASE_DRAIN=142782081
