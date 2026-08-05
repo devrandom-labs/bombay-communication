@@ -1,74 +1,69 @@
 #!/usr/bin/env bash
-# METRIC for the autoresearch loop: the composite perf SCORE (throughput divided
-# by control-latency-under-backlog). MAXIMIZE. Higher throughput and/or lower
-# control latency both raise it.
-#
-# Correctness and zero-allocation are NOT measured here — they are hard GATES in
-# .auto/checks.sh. This script only asks "how fast is the current design?". A
-# compile break makes the perf bin fail → SCORE parses as 0 → the experiment is
-# auto-reverted.
-#
-# Run UNSANDBOXED (cargo hangs under a sandboxed shell).
+# Actorpass-shaped performance metric. The perf binary owns fixed workloads;
+# this wrapper owns warming, repetition, parsing, normalization, and floors.
 set -uo pipefail
 
-# cargo may be absent from a non-interactive loop shell; fall back to the pinned
-# nix-store rust 1.96.0 (matches rust-toolchain.toml).
 if ! command -v cargo >/dev/null 2>&1; then
-	for d in /nix/store/*rust-1.96.0/bin; do
-		if [ -x "${d}/cargo" ]; then
-			PATH="${d}:${PATH}"
-			export PATH
-			break
-		fi
-	done
+  for d in /nix/store/*rust-1.96.0/bin; do
+    if [ -x "${d}/cargo" ]; then PATH="${d}:${PATH}"; export PATH; break; fi
+  done
 fi
-
-# The nix-store rust links via the system clang, which cannot find libiconv
-# outside a nix shell; point it at the nix store copy.
 for d in /nix/store/*libiconv-1.*/lib; do
-	if [ -d "${d}" ]; then
-		LIBRARY_PATH="${d}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
-		export LIBRARY_PATH
-		break
-	fi
+  if [ -d "${d}" ]; then
+    LIBRARY_PATH="${d}${LIBRARY_PATH:+:${LIBRARY_PATH}}"; export LIBRARY_PATH; break
+  fi
 done
 
-# Optimize for the host CPU; applies uniformly to every iteration.
 export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=native"
-
-# Build, then exec the binary directly: `cargo run` measurably depresses and
-# destabilizes the workload (~2x slower, higher variance) vs a direct exec.
-if ! out_build=$(cargo build -q -p fastpass-perf --release 2>&1); then
-	echo "METRIC score=0 unit=composite"
-	echo "info: perf bin failed to build — reverting"
-	printf '%s\n' "${out_build}" | tail -8
-	exit 0
+if ! build_out=$(cargo build -q -p fastpass-perf --release 2>&1); then
+  echo "METRIC score=0 unit=normalized_min"
+  echo "info: perf harness failed to build"
+  printf '%s\n' "${build_out}" | tail -12
+  exit 0
 fi
-# The first exec after a cargo build is consistently ~2x slower (cold pages
-# from cargo's target-dir scan); discard it. Then take the BEST of 3 runs:
-# machine-state drift depresses individual runs by ~10%, and the best-of-3
-# estimator keeps keep/revert decisions out of the noise. Same workload every
-# run; only the estimator is more robust.
-./target/release/fastpass-perf >/dev/null 2>&1
+
+bin=./target/release/fastpass-perf
+"${bin}" >/dev/null 2>&1
 best_score=0
+best_out=
 for _ in 1 2 3; do
-	run_out=$(./target/release/fastpass-perf 2>&1)
-	run_score=$(printf '%s\n' "${run_out}" | grep -oE 'SCORE=[0-9.]+' | head -1 | cut -d= -f2)
-	if [ -n "${run_score}" ] && awk -v a="${run_score}" -v b="${best_score}" 'BEGIN{exit !(a>b)}'; then
-		best_score=${run_score}
-		out=${run_out}
-	fi
-done
-score=${best_score}
-thr=$(printf '%s\n' "${out:-}" | grep -oE 'THROUGHPUT_OPS=[0-9.]+' | head -1 | cut -d= -f2)
-lat=$(printf '%s\n' "${out:-}" | grep -oE 'CONTROL_LATENCY_NS=[0-9.]+' | head -1 | cut -d= -f2)
+  out=$("${bin}" 2>&1)
+  direct=$(printf '%s\n' "${out}" | sed -n 's/^DIRECT_THROUGHPUT_OPS=//p' | head -1)
+  anchor=$(printf '%s\n' "${out}" | sed -n 's/^ANCHOR_THROUGHPUT_OPS=//p' | head -1)
+  latency=$(printf '%s\n' "${out}" | sed -n 's/^CONTROL_LATENCY_NS=//p' | head -1)
+  drain=$(printf '%s\n' "${out}" | sed -n 's/^DRAIN_THROUGHPUT_OPS=//p' | head -1)
+  if [ -z "${direct}" ] || [ -z "${anchor}" ] || [ -z "${latency}" ] || [ -z "${drain}" ]; then
+    continue
+  fi
 
-if [ -z "${score}" ] || [ "${score}" = "0" ]; then
-	echo "METRIC score=0 unit=composite"
-	echo "info: perf bin produced no SCORE (compile/runtime failure) — reverting"
-	printf '%s\n' "${out:-}" | tail -8
-	exit 0
+  if [ -f .auto/PERF_BASELINE ]; then
+    # shellcheck disable=SC1091
+    . .auto/PERF_BASELINE
+    score=$(awk -v d="${direct}" -v a="${anchor}" -v l="${latency}" -v r="${drain}" \
+      -v bd="${BASE_DIRECT}" -v ba="${BASE_ANCHOR}" -v bl="${BASE_CONTROL_LATENCY}" -v br="${BASE_DRAIN}" '
+      BEGIN {
+        rd=d/bd; ra=a/ba; rl=bl/l; rr=r/br;
+        min=rd; if (ra<min) min=ra; if (rl<min) min=rl; if (rr<min) min=rr;
+        if (rd<0.95 || ra<0.95 || rr<0.95 || l>bl*1.10) print 0; else print min;
+      }')
+  else
+    score=$(awk -v d="${direct}" -v a="${anchor}" -v l="${latency}" -v r="${drain}" \
+      'BEGIN { min=d; if (a<min) min=a; if (r<min) min=r; print min/l }')
+  fi
+
+  if awk -v a="${score}" -v b="${best_score}" 'BEGIN { exit !(a>b) }'; then
+    best_score=${score}; best_out=${out}
+  fi
+done
+
+if [ -z "${best_out}" ]; then
+  echo "METRIC score=0 unit=normalized_min"
+  echo "info: UserAnchor perf contract is pending or harness output is incomplete"
+  exit 0
 fi
 
-echo "METRIC score=${score} unit=composite"
-echo "info: throughput_ops=${thr} control_latency_ns=${lat}"
+echo "METRIC score=${best_score} unit=normalized_min"
+printf '%s\n' "${best_out}" | rg '^(DIRECT_THROUGHPUT_OPS|ANCHOR_THROUGHPUT_OPS|ANCHOR_OVERHEAD_NS|CONTROL_LATENCY_NS|DRAIN_THROUGHPUT_OPS)='
+if [ "${best_score}" = 0 ]; then
+  echo "info: candidate violated a per-metric performance floor"
+fi

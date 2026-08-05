@@ -1,76 +1,78 @@
 #!/usr/bin/env bash
-# GATE for the autoresearch loop: runs after a measured experiment. A non-zero
-# exit blocks `keep`, so a faster-but-broken (or cheating) design is REVERTED
-# even when its SCORE improved. This is what lets Kimi optimize aggressively
-# without regressing correctness.
-#
-# Three gates:
-#   1. Frozen surfaces unchanged vs the baseline commit — the oracle
-#      (testkit), the reference, the perf harness, and the conformance TEST
-#      files (which also pin the public API: the plug seam into bombay). Kimi
-#      may rewrite crates/fastpass/src/** and its Cargo.toml (new deps welcome),
-#      but not the things that define "correct" or "fast".
-#   2. The full conformance suite is green (P1–P7 + edge + proptest).
-#   3. The zero-alloc steady-state guard is green (inside that suite).
+# Correctness gate for every autoresearch experiment. Performance is evaluated
+# separately by measure.sh; a faster candidate never bypasses this script.
 set -uo pipefail
 
 if ! command -v cargo >/dev/null 2>&1; then
-	for d in /nix/store/*rust-1.96.0/bin; do
-		if [ -x "${d}/cargo" ]; then
-			PATH="${d}:${PATH}"
-			export PATH
-			break
-		fi
-	done
+  for d in /nix/store/*rust-1.96.0/bin; do
+    if [ -x "${d}/cargo" ]; then PATH="${d}:${PATH}"; export PATH; break; fi
+  done
 fi
-
-# The nix-store rust links via the system clang, which cannot find libiconv
-# outside a nix shell; point it at the nix store copy.
 for d in /nix/store/*libiconv-1.*/lib; do
-	if [ -d "${d}" ]; then
-		LIBRARY_PATH="${d}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
-		export LIBRARY_PATH
-		break
-	fi
+  if [ -d "${d}" ]; then
+    LIBRARY_PATH="${d}${LIBRARY_PATH:+:${LIBRARY_PATH}}"; export LIBRARY_PATH; break
+  fi
 done
 
 base=$(cat .auto/BASELINE 2>/dev/null || true)
-# Frozen surfaces: the oracle, the reference, the perf harness, and the
-# conformance/alloc/leak test files (which also pin the public API — the plug
-# seam). NOT frozen: crates/fastpass/src/**, crates/fastpass/Cargo.toml (deps),
-# and crates/fastpass/tests/loom.rs — Kimi must be free to add the loom lane.
 FROZEN=(
-	crates/fastpass-testkit
-	crates/fastpass-reference
-	crates/fastpass-perf
-	crates/fastpass/tests/property_suite.rs
-	crates/fastpass/tests/edge_cases.rs
-	crates/fastpass/tests/proptest_interleavings.rs
-	crates/fastpass/tests/alloc.rs
-	crates/fastpass/tests/leak.rs
+  .auto/prompt.md
+  .auto/measure.sh
+  .plans/card-3-user-anchor-actorpass.md
+  crates/fastpass-reference
+  crates/fastpass-testkit
+  crates/fastpass-perf
+  crates/fastpass/tests/property_suite.rs
+  crates/fastpass/tests/edge_cases.rs
+  crates/fastpass/tests/lane_lifecycle.rs
+  crates/fastpass/tests/proptest_interleavings.rs
+  crates/fastpass/tests/alloc.rs
+  crates/fastpass/tests/leak.rs
 )
-if [ -n "${base}" ]; then
-	if ! git diff --quiet "${base}" -- "${FROZEN[@]}"; then
-		echo "CHECK FAIL: a frozen surface (oracle / reference / perf harness / conformance tests) was modified"
-		exit 1
-	fi
+if [ -n "${base}" ] && ! git diff --quiet "${base}" -- "${FROZEN[@]}"; then
+  echo "CHECK FAIL: frozen contract/oracle/measurement surface changed"
+  echo "Only the one-time contract landing may thaw these files; commit it and re-pin BASELINE before optimization."
+  exit 1
 fi
 
-# Gate 2 — conformance + zero-alloc + no-leak (P1–P8). --tests skips ADR benches.
-if ! cargo test -p fastpass --tests --no-fail-fast >/dev/null 2>&1; then
-	echo "CHECK FAIL: conformance / zero-alloc / leak suite is not green"
-	exit 1
+cargo fmt --all -- --check || { echo "CHECK FAIL: rustfmt"; exit 1; }
+cargo test --workspace --tests --no-fail-fast || { echo "CHECK FAIL: workspace tests"; exit 1; }
+cargo clippy --workspace --all-targets -- -D warnings || { echo "CHECK FAIL: strict clippy"; exit 1; }
+
+LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS="--cfg loom" \
+  cargo test -p fastpass --test loom --release || {
+    echo "CHECK FAIL: bounded Loom model"; exit 1;
+  }
+
+if rg -q 'pub struct UserAnchor' crates/fastpass/src/lib.rs; then
+  required=(
+    anchor_clone_does_not_hold_lane_open
+    anchor_send_while_live
+    anchor_fails_after_last_sender
+    anchor_racing_last_drop_is_linearizable
+    cancelled_anchor_send_releases_liveness
+    anchor_try_send_steady_state_is_zero_alloc
+  )
+  for name in "${required[@]}"; do
+    rg -q "${name}" crates/fastpass/tests crates/fastpass-testkit || {
+      echo "CHECK FAIL: missing UserAnchor oracle ${name}"; exit 1;
+    }
+  done
+else
+  echo "CHECK INFO: UserAnchor contract has not landed yet"
 fi
 
-# Gate 3 — wakeup soundness: the atomic protocol must pass a loom model-check.
-# Kimi provides crates/fastpass/tests/loom.rs: a cfg(loom) atomic swap plus a
-# SYNC 2-producer/1-consumer harness over the real wakeup/backpressure protocol
-# (tokio Notify stays on the non-loom async path). Absent or failing => revert.
-# Bounded preemptions keep the exploration tractable per iteration.
-if ! LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS="--cfg loom" \
-	cargo test -p fastpass --test loom --release >/dev/null 2>&1; then
-	echo "CHECK FAIL: loom model-check of the wakeup protocol is absent or failing (crates/fastpass/tests/loom.rs)"
-	exit 1
+if [ "${FASTPASS_DEEP:-0}" = 1 ]; then
+  LOOM_MAX_PREEMPTIONS=7 RUSTFLAGS="--cfg loom" \
+    cargo test -p fastpass --test loom --release || {
+      echo "CHECK FAIL: deep Loom model"; exit 1;
+    }
+  if command -v cargo-miri >/dev/null 2>&1 || rustup component list --installed | rg -q '^miri'; then
+    cargo miri test -p fastpass || { echo "CHECK FAIL: Miri"; exit 1; }
+  else
+    echo "CHECK FAIL: FASTPASS_DEEP=1 requires Miri"
+    exit 1
+  fi
 fi
 
 echo "CHECK OK"
