@@ -32,9 +32,12 @@ const BOUND: isize = 64;
 
 #[test]
 fn lanes_do_not_leak() {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async {
-        let (ctl, _usr, mut rx) = channel::<u32, u32>(Config::new(8));
+        let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(8));
         for i in 0..M {
             ctl.send(i).unwrap();
             let _ = rx.recv().await;
@@ -46,7 +49,7 @@ fn lanes_do_not_leak() {
         }
         let growth = LIVE.load(Ordering::Relaxed) - base;
         assert!(growth <= BOUND, "control lane leaks: +{growth} (P8)");
-        drop((ctl, _usr, rx));
+        drop((ctl, usr, rx));
 
         let (_ctl, usr, mut rx) = channel::<u32, u32>(Config::new(8));
         for i in 0..M {

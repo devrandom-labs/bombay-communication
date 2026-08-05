@@ -82,7 +82,10 @@ async fn control_latency_ns() -> f64 {
         let got = rx.recv().await;
         total_ns += start.elapsed().as_nanos();
 
-        assert!(matches!(got, Some(Received::Control(1))), "control must win under backlog");
+        assert!(
+            matches!(got, Some(Received::Control(1))),
+            "control must win under backlog"
+        );
     }
     #[allow(clippy::cast_precision_loss)]
     {

@@ -17,7 +17,7 @@
 //!
 //! # Why "all upsides, no downsides" is achievable here
 //!
-//! Strict priority queueing is textbook (network QoS) and gives P1 exactly, but
+//! Strict priority queueing is textbook (network `QoS`) and gives P1 exactly, but
 //! its textbook downside is that a busy high-priority class *starves* the low
 //! one — breaking P3. We neutralise that with an **aging cap** `K`: after `K`
 //! consecutive control dequeues, one waiting user is forced through. This is a
@@ -55,7 +55,10 @@ impl Config {
     /// priority (no aging).
     #[must_use]
     pub const fn new(user_capacity: usize) -> Self {
-        Self { user_capacity, aging_cap: 0 }
+        Self {
+            user_capacity,
+            aging_cap: 0,
+        }
     }
 
     /// Force one waiting user through after `k` consecutive control dequeues.
@@ -121,7 +124,9 @@ pub struct ControlSender<C> {
 
 impl<C> Clone for ControlSender<C> {
     fn clone(&self) -> Self {
-        Self { tx: self.tx.clone() }
+        Self {
+            tx: self.tx.clone(),
+        }
     }
 }
 
@@ -131,7 +136,9 @@ impl<C> ControlSender<C> {
     /// # Errors
     /// Returns [`ControlClosed`] carrying `item` if the consumer is gone.
     pub fn send(&self, item: C) -> Result<(), ControlClosed<C>> {
-        self.tx.send(item).map_err(|flume::SendError(v)| ControlClosed(v))
+        self.tx
+            .send(item)
+            .map_err(|flume::SendError(v)| ControlClosed(v))
     }
 }
 
@@ -142,7 +149,9 @@ pub struct UserSender<U> {
 
 impl<U> Clone for UserSender<U> {
     fn clone(&self) -> Self {
-        Self { tx: self.tx.clone() }
+        Self {
+            tx: self.tx.clone(),
+        }
     }
 }
 
@@ -152,7 +161,10 @@ impl<U> UserSender<U> {
     /// # Errors
     /// Returns [`UserClosed`] carrying `item` if the consumer is gone.
     pub async fn send(&self, item: U) -> Result<(), UserClosed<U>> {
-        self.tx.send_async(item).await.map_err(|flume::SendError(v)| UserClosed(v))
+        self.tx
+            .send_async(item)
+            .await
+            .map_err(|flume::SendError(v)| UserClosed(v))
     }
 
     /// Enqueue a user message without blocking.

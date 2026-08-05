@@ -36,12 +36,12 @@
 macro_rules! property_suite {
     ($fp:ident) => {
         mod fastpass_property_suite {
-            use $fp::{Config, Received, channel};
             use ::std::collections::BTreeSet;
             use ::std::sync::Arc;
             use ::std::time::Duration;
             use ::tokio::sync::Barrier;
             use ::tokio::time::timeout;
+            use $fp::{Config, Received, channel};
 
             const GUARD: Duration = Duration::from_secs(5);
 
@@ -145,7 +145,9 @@ macro_rules! property_suite {
                 let (mut controls, mut users) = (BTreeSet::new(), BTreeSet::new());
                 loop {
                     match timeout(GUARD, rx.recv()).await.expect("no timeout") {
-                        Some(Received::Control(c)) => assert!(controls.insert(c), "dup control {c}"),
+                        Some(Received::Control(c)) => {
+                            assert!(controls.insert(c), "dup control {c}")
+                        }
                         Some(Received::User(u)) => assert!(users.insert(u), "dup user {u}"),
                         // End-marker, delivered once both lanes are closed
                         // and the ring drained; not part of the multisets.
@@ -268,7 +270,11 @@ macro_rules! property_suite {
                         users.push(u);
                     }
                 }
-                assert_eq!(users, (0..10).collect::<Vec<_>>(), "user FIFO broke under interleave");
+                assert_eq!(
+                    users,
+                    (0..10).collect::<Vec<_>>(),
+                    "user FIFO broke under interleave"
+                );
             }
 
             // Lifecycle (1) — `UserLaneClosed` fires AT MOST once per channel.
@@ -340,7 +346,9 @@ macro_rules! property_suite {
                 // PARK — no leg, no None. (Deterministic: nothing can wake or
                 // satisfy the consumer, so only the timeout fires.)
                 assert!(
-                    timeout(Duration::from_millis(100), rx.recv()).await.is_err(),
+                    timeout(Duration::from_millis(100), rx.recv())
+                        .await
+                        .is_err(),
                     "recv returned while a UserSender clone lives (premature leg or None)"
                 );
                 usr2.try_send(2).unwrap();
@@ -348,7 +356,12 @@ macro_rules! property_suite {
                 drop(usr2);
                 assert!(matches!(recv1(&mut rx).await, Received::UserLaneClosed));
                 drop(ctl);
-                assert!(timeout(GUARD, rx.recv()).await.expect("recv stalled").is_none());
+                assert!(
+                    timeout(GUARD, rx.recv())
+                        .await
+                        .expect("recv stalled")
+                        .is_none()
+                );
             }
 
             // Lifecycle (4) — after the leg, `recv` keeps serving control
@@ -379,7 +392,12 @@ macro_rules! property_suite {
                 ctl.send(3).unwrap();
                 assert_eq!(recv1(&mut rx).await, Received::Control(3));
                 drop(ctl);
-                assert!(timeout(GUARD, rx.recv()).await.expect("recv stalled").is_none());
+                assert!(
+                    timeout(GUARD, rx.recv())
+                        .await
+                        .expect("recv stalled")
+                        .is_none()
+                );
             }
 
             // Lifecycle (5) — `recv_control` serves control in ticket (FIFO)
@@ -403,7 +421,11 @@ macro_rules! property_suite {
                             .expect("control item expected"),
                     );
                 }
-                assert_eq!(controls, (0..4).collect::<Vec<_>>(), "recv_control not FIFO");
+                assert_eq!(
+                    controls,
+                    (0..4).collect::<Vec<_>>(),
+                    "recv_control not FIFO"
+                );
                 // Every user item is still there, in order: close the user
                 // lane and drain to the end-marker (a stolen item shrinks
                 // the drained count, failing the assert — never a stall).
@@ -416,7 +438,11 @@ macro_rules! property_suite {
                         x => panic!("expected a user item or the end-marker, got {x:?}"),
                     }
                 }
-                assert_eq!(users, (0..8).collect::<Vec<_>>(), "recv_control consumed user items");
+                assert_eq!(
+                    users,
+                    (0..8).collect::<Vec<_>>(),
+                    "recv_control consumed user items"
+                );
             }
 
             // Lifecycle (6) — `recv_control` returns `None` only when the
@@ -427,7 +453,9 @@ macro_rules! property_suite {
                 let (ctl, _usr, mut rx) = channel::<u32, u32>(Config::new(8));
                 // Open + empty: parks (no None while a sender lives).
                 assert!(
-                    timeout(Duration::from_millis(100), rx.recv_control()).await.is_err(),
+                    timeout(Duration::from_millis(100), rx.recv_control())
+                        .await
+                        .is_err(),
                     "recv_control returned on an open, empty control lane"
                 );
                 // Queued item + closed lane: the item comes first, then None
@@ -435,12 +463,16 @@ macro_rules! property_suite {
                 ctl.send(1).unwrap();
                 drop(ctl);
                 assert_eq!(
-                    timeout(GUARD, rx.recv_control()).await.expect("recv_control stalled"),
+                    timeout(GUARD, rx.recv_control())
+                        .await
+                        .expect("recv_control stalled"),
                     Some(1),
                     "queued control lost to the lane closure"
                 );
                 assert_eq!(
-                    timeout(GUARD, rx.recv_control()).await.expect("recv_control stalled"),
+                    timeout(GUARD, rx.recv_control())
+                        .await
+                        .expect("recv_control stalled"),
                     None,
                     "control lane closed and drained — must be None"
                 );
@@ -448,7 +480,9 @@ macro_rules! property_suite {
                 let (ctl2, _usr2, mut rx2) = channel::<u32, u32>(Config::new(8));
                 drop(ctl2);
                 assert_eq!(
-                    timeout(GUARD, rx2.recv_control()).await.expect("recv_control stalled"),
+                    timeout(GUARD, rx2.recv_control())
+                        .await
+                        .expect("recv_control stalled"),
                     None,
                     "closed empty control lane must yield None"
                 );
@@ -463,9 +497,9 @@ macro_rules! property_suite {
 macro_rules! alloc_guard {
     ($fp:ident) => {
         mod fastpass_alloc_guard {
-            use $fp::{Config, channel};
             use ::std::alloc::{GlobalAlloc, Layout, System};
             use ::std::sync::atomic::{AtomicUsize, Ordering};
+            use $fp::{Config, channel};
 
             static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 

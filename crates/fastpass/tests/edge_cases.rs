@@ -56,7 +56,10 @@ async fn cap_zero_rendezvous_loses_nothing() {
     let mut got_u = Vec::new();
     let mut got_c = Vec::new();
     while got_u.len() + got_c.len() < (2 * N) as usize {
-        match timeout(GUARD, rx.recv()).await.expect("rendezvous recv stalled") {
+        match timeout(GUARD, rx.recv())
+            .await
+            .expect("rendezvous recv stalled")
+        {
             Some(Received::User(u)) => got_u.push(u),
             Some(Received::Control(c)) => got_c.push(c),
             // End-marker (post-#225 lane-lifecycle addition): not a payload
@@ -67,8 +70,16 @@ async fn cap_zero_rendezvous_loses_nothing() {
     }
     producer.await.unwrap();
 
-    assert_eq!(got_u, (0..N).collect::<Vec<_>>(), "user lane: loss/dup/reorder at cap 0");
-    assert_eq!(got_c, (0..N).collect::<Vec<_>>(), "control lane: loss/dup/reorder at cap 0");
+    assert_eq!(
+        got_u,
+        (0..N).collect::<Vec<_>>(),
+        "user lane: loss/dup/reorder at cap 0"
+    );
+    assert_eq!(
+        got_c,
+        (0..N).collect::<Vec<_>>(),
+        "control lane: loss/dup/reorder at cap 0"
+    );
 }
 
 #[tokio::test]
@@ -103,14 +114,25 @@ async fn recv_future_cancellation_loses_nothing() {
                 Some(Received::UserLaneClosed) => {}
                 None => break,
             },
-            _ = tokio::time::sleep(Duration::from_micros(50)) => cancels += 1,
+            () = tokio::time::sleep(Duration::from_micros(50)) => cancels += 1,
         }
     }
     producer.await.unwrap();
 
-    assert!(cancels > 0, "cancellation path was never exercised — the test is vacuous");
-    assert_eq!(got_c, (0..N).collect::<Vec<_>>(), "control lane: loss/dup across cancel");
-    assert_eq!(got_u, (0..N).collect::<Vec<_>>(), "user lane: loss/dup across cancel");
+    assert!(
+        cancels > 0,
+        "cancellation path was never exercised — the test is vacuous"
+    );
+    assert_eq!(
+        got_c,
+        (0..N).collect::<Vec<_>>(),
+        "control lane: loss/dup across cancel"
+    );
+    assert_eq!(
+        got_u,
+        (0..N).collect::<Vec<_>>(),
+        "user lane: loss/dup across cancel"
+    );
 }
 
 #[tokio::test]
@@ -127,7 +149,11 @@ async fn drain_teardown_race_discards_blocked_sender_item() {
     ctl.send(7).unwrap();
 
     let drained = rx.drain();
-    assert_eq!(drained.user, vec![10, 11], "drain must return queued users, FIFO");
+    assert_eq!(
+        drained.user,
+        vec![10, 11],
+        "drain must return queued users, FIFO"
+    );
     assert_eq!(drained.control, vec![7], "drain must return queued control");
 
     // Teardown seam (flume-level, unfixable from Consumer): the parked send is
@@ -185,11 +211,23 @@ async fn closed_empty_recv_returns_none_repeatedly() {
     // Since the lane-lifecycle addition the one-shot end-marker comes FIRST
     // (the user lane is terminally closed and drained); `None` follows.
     assert!(matches!(
-        timeout(GUARD, rx.recv()).await.expect("marker recv stalled"),
+        timeout(GUARD, rx.recv())
+            .await
+            .expect("marker recv stalled"),
         Some(Received::UserLaneClosed)
     ));
-    assert!(timeout(GUARD, rx.recv()).await.expect("first recv stalled").is_none());
+    assert!(
+        timeout(GUARD, rx.recv())
+            .await
+            .expect("first recv stalled")
+            .is_none()
+    );
     // Second None call: both closed flags set. The early return must fire before the
     // parked select! — with both arms disabled and no else, select! panics.
-    assert!(timeout(GUARD, rx.recv()).await.expect("second recv stalled").is_none());
+    assert!(
+        timeout(GUARD, rx.recv())
+            .await
+            .expect("second recv stalled")
+            .is_none()
+    );
 }

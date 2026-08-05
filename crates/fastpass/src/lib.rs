@@ -193,7 +193,10 @@ impl Config {
     /// (floor 2), and the rounded size is the effective capacity.
     #[must_use]
     pub const fn new(user_capacity: usize) -> Self {
-        Self { user_capacity, aging_cap: 0 }
+        Self {
+            user_capacity,
+            aging_cap: 0,
+        }
     }
 
     /// Force one waiting user through after `k` consecutive control dequeues.
@@ -337,6 +340,12 @@ impl<U> UserLane<U> {
 
     /// Try to enqueue `v`; on failure hands `v` back (ring full).
     #[inline]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::comparison_chain,
+        reason = "ticket arithmetic intentionally operates modulo 2^32; channel() bounds the live window"
+    )]
     fn try_push(&self, v: U) -> Result<(), U> {
         let mask = self.mask();
         let mut pos = self.tail.load(Ordering::Acquire);
@@ -373,6 +382,10 @@ impl<U> UserLane<U> {
 
     /// Dequeue the head item, if one is published. Consumer-only.
     #[inline]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "ticket arithmetic intentionally operates modulo 2^32; channel() bounds the live window"
+    )]
     fn pop(&self) -> Option<U> {
         let head = self.head.load(Ordering::Relaxed);
         // SAFETY: `head & mask` is always in bounds.
@@ -385,8 +398,10 @@ impl<U> UserLane<U> {
         // before this read; only the consumer pops, and the slot is not
         // reused until re-ticketed below.
         let v = unsafe { slot.val.get().read().assume_init() };
-        slot.seq
-            .store(head32.wrapping_add(self.ring.len() as u32), Ordering::Release);
+        slot.seq.store(
+            head32.wrapping_add(self.ring.len() as u32),
+            Ordering::Release,
+        );
         self.head.store(head.wrapping_add(1), Ordering::Relaxed);
         // Wake one parked producer, if any — checked every 4th pop only;
         // a parked producer is also released by the consumer's pre-park
@@ -422,6 +437,10 @@ impl<U> UserLane<U> {
 }
 
 impl<U> Drop for UserLane<U> {
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "ticket arithmetic intentionally operates modulo 2^32; channel() bounds the live window"
+    )]
     fn drop(&mut self) {
         // Quiescent: all senders and the consumer are gone, so `head..tail`
         // are exactly the published-but-unconsumed items.
@@ -462,6 +481,10 @@ struct CBlock<C> {
 }
 
 impl<C> CBlock<C> {
+    #[allow(
+        clippy::unnecessary_box_returns,
+        reason = "control blocks are immediately converted to stable raw pointers for the linked queue"
+    )]
     fn new(idx: usize) -> Box<Self> {
         Box::new(Self {
             idx,
@@ -488,7 +511,7 @@ struct ControlLane<C> {
     /// Live frontier: the first block a push may walk from. Monotonic,
     /// consumer-only writer, published BEFORE the corresponding reclamation
     /// check so a push that registers in-flight afterwards is guaranteed
-    /// (SeqCst chain) to read a frontier above the freed prefix.
+    /// (`SeqCst` chain) to read a frontier above the freed prefix.
     first_block: AtomicPtr<CBlock<C>>,
     /// First unfreed block. Blocks in `[free_anchor, first_block)` are
     /// retired (fully consumed) but not yet freed — freeing waits for an
@@ -614,7 +637,7 @@ impl<C> ControlLane<C> {
     /// Ordering (Dekker over SeqCst): the frontier store (p1) precedes the
     /// `in_flight` read (p2) in program order. A slow push's increment
     /// (p3) precedes its frontier/hint loads (p4). If p2 observes zero,
-    /// any push still walking has p3 AFTER p2 in the SeqCst order, hence
+    /// any push still walking has p3 AFTER p2 in the `SeqCst` order, hence
     /// p4 > p3 > p2 > p1: it reads a frontier >= the one published here,
     /// and `tail_block` >= `first_block` always, so no push ever walks a
     /// block this call frees. FAST pushes (`hint.idx == want`) write into
@@ -709,7 +732,9 @@ pub struct ControlSender<C> {
 impl<C> Clone for ControlSender<C> {
     fn clone(&self) -> Self {
         self.lane.senders.fetch_add(1, Ordering::Relaxed);
-        Self { lane: self.lane.clone() }
+        Self {
+            lane: self.lane.clone(),
+        }
     }
 }
 
@@ -751,7 +776,9 @@ pub struct UserSender<U> {
 impl<U> Clone for UserSender<U> {
     fn clone(&self) -> Self {
         self.lane.senders.fetch_add(1, Ordering::Relaxed);
-        Self { lane: self.lane.clone() }
+        Self {
+            lane: self.lane.clone(),
+        }
     }
 }
 
@@ -1340,6 +1367,10 @@ impl<C, U> Consumer<C, U> {
     /// (or treat a send racing `drain` as maybe-undelivered). Pinned by
     /// `edge_cases::drain_teardown_race_discards_blocked_sender_item`.
     #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "ticket arithmetic intentionally operates modulo 2^32; channel() bounds the live window"
+    )]
     pub fn drain(mut self) -> Drained<C, U> {
         self.teardown();
         let mut control: Vec<C> = Vec::new();
@@ -1389,7 +1420,15 @@ impl<C, U> Drop for Consumer<C, U> {
 
 /// Build a two-lane priority channel: an unbounded control lane and a bounded
 /// user lane feeding one [`Consumer`].
+///
+/// # Panics
+///
+/// Panics when the rounded user capacity exceeds the live `u32` ticket window.
 #[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "capacity is asserted below the u32 ticket window before slot tickets are initialized"
+)]
 pub fn channel<C, U>(cfg: Config) -> (ControlSender<C>, UserSender<U>, Consumer<C, U>) {
     // A capacity-0 (rendezvous) config is served by buffer slots: the FIFO
     // and no-loss semantics are identical, and the send side still paces on

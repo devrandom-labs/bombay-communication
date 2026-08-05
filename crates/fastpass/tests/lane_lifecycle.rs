@@ -47,10 +47,20 @@ async fn parked_recv_wakes_with_user_lane_closed_on_last_sender_drop() {
     dropper.await.unwrap();
     // The control lane is still fully usable afterwards.
     ctl.send(1).unwrap();
-    let got = timeout(GUARD, rx.recv()).await.expect("control recv stalled");
-    assert!(matches!(got, Some(Received::Control(1))), "control after the marker: {got:?}");
+    let got = timeout(GUARD, rx.recv())
+        .await
+        .expect("control recv stalled");
+    assert!(
+        matches!(got, Some(Received::Control(1))),
+        "control after the marker: {got:?}"
+    );
     drop(ctl);
-    assert!(timeout(GUARD, rx.recv()).await.expect("recv stalled").is_none());
+    assert!(
+        timeout(GUARD, rx.recv())
+            .await
+            .expect("recv stalled")
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -67,23 +77,47 @@ async fn recv_control_flows_with_full_user_ring() {
 
     ctl.send(1).unwrap();
     ctl.send(2).unwrap();
-    assert_eq!(timeout(GUARD, rx.recv_control()).await.expect("recv_control stalled"), Some(1));
-    assert_eq!(timeout(GUARD, rx.recv_control()).await.expect("recv_control stalled"), Some(2));
+    assert_eq!(
+        timeout(GUARD, rx.recv_control())
+            .await
+            .expect("recv_control stalled"),
+        Some(1)
+    );
+    assert_eq!(
+        timeout(GUARD, rx.recv_control())
+            .await
+            .expect("recv_control stalled"),
+        Some(2)
+    );
 
     // recv_control consumed no user item and released no parked producer:
     // the blocked send is STILL parked. (Deterministic: only a consumer
     // pop or teardown can release it, and neither happened.)
     assert!(
-        timeout(Duration::from_millis(100), &mut blocked).await.is_err(),
+        timeout(Duration::from_millis(100), &mut blocked)
+            .await
+            .is_err(),
         "recv_control released a producer parked on the full ring — it must not touch the user lane"
     );
 
     // The user lane drains via `recv` untouched and in order; the parked
     // send then lands and its item follows.
-    assert!(matches!(timeout(GUARD, rx.recv()).await.expect("recv stalled"), Some(Received::User(10))));
-    assert!(matches!(timeout(GUARD, rx.recv()).await.expect("recv stalled"), Some(Received::User(11))));
-    blocked.await.unwrap().expect("blocked send resolves once recv makes room");
-    assert!(matches!(timeout(GUARD, rx.recv()).await.expect("recv stalled"), Some(Received::User(12))));
+    assert!(matches!(
+        timeout(GUARD, rx.recv()).await.expect("recv stalled"),
+        Some(Received::User(10))
+    ));
+    assert!(matches!(
+        timeout(GUARD, rx.recv()).await.expect("recv stalled"),
+        Some(Received::User(11))
+    ));
+    blocked
+        .await
+        .unwrap()
+        .expect("blocked send resolves once recv makes room");
+    assert!(matches!(
+        timeout(GUARD, rx.recv()).await.expect("recv stalled"),
+        Some(Received::User(12))
+    ));
 
     drop(usr);
     drop(ctl);
@@ -91,7 +125,12 @@ async fn recv_control_flows_with_full_user_ring() {
         timeout(GUARD, rx.recv()).await.expect("recv stalled"),
         Some(Received::UserLaneClosed)
     ));
-    assert!(timeout(GUARD, rx.recv()).await.expect("recv stalled").is_none());
+    assert!(
+        timeout(GUARD, rx.recv())
+            .await
+            .expect("recv stalled")
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -102,8 +141,14 @@ async fn parked_for_restart_shape() {
     drop(usr); // the actor's user handles are gone — drain-stop
 
     // Remaining user work drains first, then the one-shot marker lands.
-    assert!(matches!(timeout(GUARD, rx.recv()).await.expect("recv stalled"), Some(Received::User(1))));
-    assert!(matches!(timeout(GUARD, rx.recv()).await.expect("recv stalled"), Some(Received::User(2))));
+    assert!(matches!(
+        timeout(GUARD, rx.recv()).await.expect("recv stalled"),
+        Some(Received::User(1))
+    ));
+    assert!(matches!(
+        timeout(GUARD, rx.recv()).await.expect("recv stalled"),
+        Some(Received::User(2))
+    ));
     assert!(matches!(
         timeout(GUARD, rx.recv()).await.expect("recv stalled"),
         Some(Received::UserLaneClosed)
@@ -111,11 +156,26 @@ async fn parked_for_restart_shape() {
 
     // Parked-for-restart: read the control lane WITHOUT touching user state.
     ctl.send(99).unwrap();
-    assert_eq!(timeout(GUARD, rx.recv_control()).await.expect("recv_control stalled"), Some(99));
+    assert_eq!(
+        timeout(GUARD, rx.recv_control())
+            .await
+            .expect("recv_control stalled"),
+        Some(99)
+    );
 
     // Teardown instead: the control lane closes; recv_control drains to None.
     drop(ctl);
-    assert_eq!(timeout(GUARD, rx.recv_control()).await.expect("recv_control stalled"), None);
+    assert_eq!(
+        timeout(GUARD, rx.recv_control())
+            .await
+            .expect("recv_control stalled"),
+        None
+    );
     // And the merged recv agrees: everything is gone.
-    assert!(timeout(GUARD, rx.recv()).await.expect("recv stalled").is_none());
+    assert!(
+        timeout(GUARD, rx.recv())
+            .await
+            .expect("recv stalled")
+            .is_none()
+    );
 }

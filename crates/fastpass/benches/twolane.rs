@@ -7,6 +7,9 @@ use fastpass::{Config, Received, channel};
 use std::hint::black_box;
 use tokio::runtime::Runtime;
 
+const DRAIN_ITEMS_PER_LANE: u32 = 10_000;
+const CONTENTION_ITEMS_PER_LANE: u32 = 10_000;
+
 // P1 metric: with `depth` user messages already queued, how long to receive a
 // single control signal? Strict priority keeps this flat; head-of-line blocking
 // makes it grow with `depth`.
@@ -39,12 +42,12 @@ fn control_latency_under_backlog(c: &mut Criterion) {
 // Throughput: enqueue N on each lane, drain all N*2 via recv.
 fn drain_throughput(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    const N: u32 = 10_000;
     c.bench_function("drain_throughput_20k", |b| {
         b.to_async(&rt).iter_batched(
             || {
-                let (ctl, usr, rx) = channel::<u32, u32>(Config::new(N as usize));
-                for i in 0..N {
+                let (ctl, usr, rx) =
+                    channel::<u32, u32>(Config::new(DRAIN_ITEMS_PER_LANE as usize));
+                for i in 0..DRAIN_ITEMS_PER_LANE {
                     ctl.send(i).unwrap();
                     usr.try_send(i).unwrap();
                 }
@@ -58,7 +61,7 @@ fn drain_throughput(c: &mut Criterion) {
                     black_box(&x);
                     n += 1;
                 }
-                assert_eq!(n, N * 2);
+                assert_eq!(n, DRAIN_ITEMS_PER_LANE * 2);
             },
             criterion::BatchSize::SmallInput,
         );
@@ -172,7 +175,6 @@ fn producer_contention(c: &mut Criterion) {
         .enable_all()
         .build()
         .unwrap();
-    const PER_LANE: u32 = 10_000;
     let mut group = c.benchmark_group("producer_contention_2p_40k");
     group.sample_size(20);
     group.measurement_time(std::time::Duration::from_secs(3));
@@ -185,7 +187,7 @@ fn producer_contention(c: &mut Criterion) {
                 let ctl = ctl.clone();
                 let usr = usr.clone();
                 handles.push(tokio::spawn(async move {
-                    for i in 0..PER_LANE {
+                    for i in 0..CONTENTION_ITEMS_PER_LANE {
                         ctl.send(i).unwrap();
                         usr.send(i).await.unwrap();
                     }
@@ -198,7 +200,7 @@ fn producer_contention(c: &mut Criterion) {
                 black_box(&x);
                 n += 1;
             }
-            assert_eq!(n, PER_LANE * 4);
+            assert_eq!(n, CONTENTION_ITEMS_PER_LANE * 4);
             for h in handles {
                 h.await.unwrap();
             }
@@ -212,7 +214,7 @@ fn producer_contention(c: &mut Criterion) {
             for _ in 0..2 {
                 let q = std::sync::Arc::clone(&q);
                 handles.push(tokio::spawn(async move {
-                    for i in 0..PER_LANE {
+                    for i in 0..CONTENTION_ITEMS_PER_LANE {
                         q.send_control(i);
                         q.send_user(i);
                     }
@@ -234,7 +236,7 @@ fn producer_contention(c: &mut Criterion) {
             }
             q.close_senders();
             let n = consumer.await.unwrap();
-            assert_eq!(n, PER_LANE * 4);
+            assert_eq!(n, CONTENTION_ITEMS_PER_LANE * 4);
         });
     });
     group.finish();

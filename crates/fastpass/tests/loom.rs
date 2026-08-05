@@ -192,7 +192,11 @@ fn recv_control_parking_preserves_user_lane() {
         }
         parked_producer.join().unwrap();
         control_producer.join().unwrap();
-        assert_eq!(got, [0, 1, 2], "recv_control consumed or reordered user items");
+        assert_eq!(
+            got,
+            [0, 1, 2],
+            "recv_control consumed or reordered user items"
+        );
         assert_eq!(legs, 1, "UserLaneClosed must fire exactly once");
     });
 }

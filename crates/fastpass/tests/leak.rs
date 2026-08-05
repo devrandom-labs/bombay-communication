@@ -40,11 +40,14 @@ const BOUND: isize = 64;
 
 #[test]
 fn lanes_do_not_leak() {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async {
         // Control lane: warm up (settle one-time allocations), then churn M more
         // and require the live count not to grow.
-        let (ctl, _usr, mut rx) = channel::<u32, u32>(Config::new(8));
+        let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(8));
         for i in 0..M {
             ctl.send(i).unwrap();
             let _ = rx.recv().await;
@@ -59,7 +62,7 @@ fn lanes_do_not_leak() {
             growth <= BOUND,
             "control lane leaks: +{growth} live allocations over {M} churned items after warmup (P8)"
         );
-        drop((ctl, _usr, rx));
+        drop((ctl, usr, rx));
 
         // User lane: same discipline through the ring.
         let (_ctl, usr, mut rx) = channel::<u32, u32>(Config::new(8));

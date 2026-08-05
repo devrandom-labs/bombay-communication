@@ -3,7 +3,7 @@
 //!
 //! 1. `preloaded_backlog_matches_policy_model` — both lanes fully preloaded,
 //!    senders dropped, then drained. With no timing in play the merge is a
-//!    pure function of (users, controls, aging_cap), so the expected output is
+//!    pure function of (users, controls, `aging_cap`), so the expected output is
 //!    computed EXACTLY by a model of the documented policy and compared item
 //!    for item. This fails on: the user-biased stub, missing aging, an
 //!    off-by-one in the streak counter, or a lost/duplicated item.
@@ -27,7 +27,11 @@ const GUARD: Duration = Duration::from_secs(10);
 /// starts, so the marker is deliverable wherever the policy next serves a
 /// user with an empty user queue — the aging slot (streak at `k`) or the
 /// control-empty slot — and it resets the streak like a user item.
-fn model(users: &mut VecDeque<u32>, controls: &mut VecDeque<u32>, k: usize) -> Vec<Received<u32, u32>> {
+fn model(
+    users: &mut VecDeque<u32>,
+    controls: &mut VecDeque<u32>,
+    k: usize,
+) -> Vec<Received<u32, u32>> {
     let mut out = Vec::with_capacity(users.len() + controls.len() + 1);
     let mut streak = 0usize;
     let mut leg_pending = true; // user lane terminally closed from the start
@@ -109,6 +113,10 @@ proptest! {
     }
 
     #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "generated counts are bounded to 200 by the proptest strategy"
+    )]
     fn concurrent_producers_no_loss_fifo(
         k in 0usize..=4,
         n_users in 0usize..=200,
