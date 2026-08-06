@@ -16,6 +16,7 @@ done
 
 base=$(cat .auto/BASELINE 2>/dev/null || true)
 FROZEN=(
+  .auto/checks.sh
   .auto/prompt.md
   .auto/measure.sh
   .plans/card-3-user-anchor-actorpass.md
@@ -68,7 +69,16 @@ if [ "${FASTPASS_DEEP:-0}" = 1 ]; then
       echo "CHECK FAIL: deep Loom model"; exit 1;
     }
   if command -v cargo-miri >/dev/null 2>&1 || rustup component list --installed | rg -q '^miri'; then
-    cargo miri test -p fastpass || { echo "CHECK FAIL: Miri"; exit 1; }
+    # Proptest's persistence needs filesystem isolation disabled and its
+    # randomized state spaces are prohibitively slow under interpretation.
+    # They remain mandatory in the native workspace gate above; Miri covers
+    # the deterministic lifecycle, property, allocation, and leak suites.
+    cargo miri test -p fastpass -- \
+      --skip anchor_schedules_match_lane_state_machine \
+      --skip concurrent_producers_no_loss_fifo \
+      --skip preloaded_backlog_matches_policy_model || {
+      echo "CHECK FAIL: Miri"; exit 1;
+    }
   else
     echo "CHECK FAIL: FASTPASS_DEEP=1 requires Miri"
     exit 1

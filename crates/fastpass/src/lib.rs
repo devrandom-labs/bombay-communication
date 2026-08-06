@@ -950,12 +950,19 @@ impl<U> UserSender<U> {
 /// the `senders` counter, NOT the strong count, so the model stays faithful
 /// — the strong-ref distinction is pure memory reclamation, covered on
 /// hardware by `tests/leak.rs`.
-#[derive(Clone)]
 pub struct UserAnchor<U> {
     #[cfg(not(loom))]
     lane: Weak<UserLane<U>>,
     #[cfg(loom)]
     lane: Arc<UserLane<U>>,
+}
+
+impl<U> Clone for UserAnchor<U> {
+    fn clone(&self) -> Self {
+        Self {
+            lane: self.lane.clone(),
+        }
+    }
 }
 
 impl<U> UserAnchor<U> {

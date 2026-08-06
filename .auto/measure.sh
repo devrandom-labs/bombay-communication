@@ -51,7 +51,9 @@ for _ in 1 2 3; do
       'BEGIN { min=d; if (a<min) min=a; if (r<min) min=r; print min/l }')
   fi
 
-  if awk -v a="${score}" -v b="${best_score}" 'BEGIN { exit !(a>b) }'; then
+  # Retain the first complete sample even when it scores zero, so a genuine
+  # floor violation is reported as such rather than mislabeled as incomplete.
+  if [ -z "${best_out}" ] || awk -v a="${score}" -v b="${best_score}" 'BEGIN { exit !(a>b) }'; then
     best_score=${score}; best_out=${out}
   fi
 done

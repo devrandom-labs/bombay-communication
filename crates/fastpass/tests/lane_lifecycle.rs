@@ -24,6 +24,20 @@ use tokio::time::timeout;
 
 const GUARD: Duration = Duration::from_secs(5);
 
+#[derive(Debug)]
+struct MoveOnly(u64);
+
+#[tokio::test]
+async fn anchor_clone_supports_move_only_items() {
+    let (_control, user, mut consumer) = channel::<(), MoveOnly>(Config::new(2));
+    let anchor = user.anchor().clone();
+    anchor.send(MoveOnly(7)).await.unwrap();
+    let Some(Received::User(item)) = consumer.recv().await else {
+        panic!("move-only user item must be delivered");
+    };
+    assert_eq!(item.0, 7);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parked_recv_wakes_with_user_lane_closed_on_last_sender_drop() {
     let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(8));

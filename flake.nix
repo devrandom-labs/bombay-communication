@@ -67,7 +67,7 @@
           shellHook = ''
             echo "fastpass MIRI shell — nightly, on-demand only."
             echo "  cargo miri setup"
-            echo "  MIRIFLAGS=\"-Zmiri-many-seeds=8\" cargo miri test -p fastpass"
+            echo "  MIRIFLAGS=\"-Zmiri-many-seeds=..8\" cargo miri test -p fastpass"
           '';
         };
       }
