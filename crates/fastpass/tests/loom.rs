@@ -15,9 +15,14 @@
 //! Explored properties, on every interleaving loom enumerates:
 //! termination (no lost wakeup / no hang — loom fails a deadlocked
 //! schedule), no loss, no duplication, per-lane FIFO, the
-//! `UserLaneClosed` end-marker's exactly-once latch, and `recv_control`'s
-//! park/wake discipline with a saturated user ring. The card-3 `UserAnchor`
-//! models (F–H) check the conditional-increment counter protocol itself:
+//! `UserLaneClosed` end-marker's exactly-once latch, `recv_control`'s
+//! park/wake discipline with a saturated user ring, and the teardown
+//! contract: a producer released by consumer teardown either linearized
+//! (its send resolved `Ok`) or gets its exact payload back as
+//! `Err(UserClosed)` — across the registration/recheck/park/wakeup race
+//! windows and for multiple producers at once (models C, J, K). The
+//! card-3 `UserAnchor` models (F–H) check the conditional-increment
+//! counter protocol itself:
 //! upgrade-vs-last-drop linearizability and marker ordering (F), a blocked
 //! anchor send holding liveness until its item lands (G), and the RAII
 //! release of an upgrade dropped without delivery (H). The control block
@@ -34,6 +39,7 @@
 #![cfg(loom)]
 
 use fastpass::{Config, Received, channel};
+use loom::sync::atomic::Ordering;
 
 #[test]
 fn user_backpressure_wakeup() {
@@ -107,25 +113,136 @@ fn consumer_wakeup_and_control_chain() {
 #[test]
 fn teardown_releases_parked_producer() {
     // C — teardown release: a producer parked on a full ring must be
-    // released when the consumer is dropped (the pinned seam: the parked
-    // send resolves `Ok` and the item is discarded). loom fails the model
-    // on any schedule where the producer stays parked — termination IS the
-    // assertion.
+    // released when the consumer is dropped, and a send that never
+    // linearized must come back as `Err(UserClosed(payload))` with its
+    // exact payload. loom fails the model on any schedule where the
+    // producer stays parked — termination IS the no-lost-wakeup assertion.
+    // The consumer pops once before tearing down, so a blocked send CAN
+    // still win the freed slot and resolve `Ok` legitimately: the
+    // assertion is the Ok-prefix/Err-suffix rule with payload identity,
+    // and the discriminating no-pop shape lives in model J.
     loom::model(|| {
         let (_ctl, usr, mut rx) = channel::<u32, u32>(Config::new(2));
         let producer = loom::thread::spawn(move || {
+            let mut results = Vec::new();
             for i in 0..3u32 {
-                // `Err` only if the teardown beat the first send; either
-                // way the send must RESOLVE, never hang.
-                let _ = usr.send_blocking(i);
+                match usr.send_blocking(i) {
+                    Ok(()) => results.push(Ok(i)),
+                    Err(fastpass::UserClosed(v)) => {
+                        assert_eq!(v, i, "returned payload is not the sent one");
+                        results.push(Err(i));
+                    }
+                }
             }
+            results
         });
         // Take one item (waits for the first send), then tear down with the
         // ring likely full and the producer likely parked.
         let first = rx.recv_blocking();
         assert!(first.is_some());
         drop(rx);
-        producer.join().unwrap();
+        let results = producer.join().unwrap();
+        // Once a send observes teardown every later send must fail at the
+        // same check: an Ok may only precede Errs, never follow them, and
+        // each Err carried its exact payload (asserted above).
+        let first_err = results.iter().position(Result::is_err);
+        assert!(
+            first_err.is_none_or(|k| results[k..].iter().all(Result::is_err)),
+            "an Ok send followed a failed one after teardown: {results:?}"
+        );
+    });
+}
+
+#[test]
+fn teardown_returns_unlinearized_payloads() {
+    // J — the discriminating shape: NO consumer pop ever frees a slot, so
+    // with capacity 2 at most two sends can linearize; every later send is
+    // released BY teardown and must return its exact payload. The payloads
+    // are drop-counted: at model end every constructed payload was dropped
+    // exactly once (returned ones by the assertion scope, published ones by
+    // the lane's Drop). A release-reports-Ok variant fails this model with
+    // one preemption (an Ok past the capacity bound).
+    loom::model(|| {
+        let drops = loom::sync::Arc::new(loom::sync::atomic::AtomicUsize::new(0));
+        #[derive(Debug)]
+        struct Counted(loom::sync::Arc<loom::sync::atomic::AtomicUsize>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let (_ctl, usr, rx) = channel::<u32, Counted>(Config::new(2));
+        let producer = loom::thread::spawn({
+            let drops = drops.clone();
+            move || {
+                let mut oks = 0usize;
+                for _ in 0..3 {
+                    match usr.send_blocking(Counted(drops.clone())) {
+                        Ok(()) => oks += 1,
+                        Err(fastpass::UserClosed(p)) => drop(p),
+                    }
+                }
+                oks
+            }
+        });
+        drop(rx); // teardown immediately: no pop ever frees a slot
+        let oks = producer.join().unwrap();
+        assert!(
+            oks <= 2,
+            "{oks} sends resolved Ok with no consumer pop — capacity 2 bounds linearizations; \
+             a teardown release must return Err(UserClosed(payload))"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            3,
+            "payload leak or double-drop across teardown"
+        );
+    });
+}
+
+#[test]
+fn teardown_releases_multiple_producers_with_their_payloads() {
+    // K — multiple producers parked on the SAME full ring are all released
+    // by teardown, each with its own payload, and every payload is dropped
+    // exactly once. The ring is pre-filled and never popped, so neither
+    // producer can linearize: both sends must come back `Err(UserClosed)`.
+    loom::model(|| {
+        let drops = loom::sync::Arc::new(loom::sync::atomic::AtomicUsize::new(0));
+        #[derive(Debug)]
+        struct Counted(u32, loom::sync::Arc<loom::sync::atomic::AtomicUsize>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.1.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let (_ctl, usr, rx) = channel::<u32, Counted>(Config::new(2));
+        usr.try_send(Counted(1, drops.clone())).expect("ring empty");
+        usr.try_send(Counted(2, drops.clone())).expect("capacity 2");
+        let p1 = loom::thread::spawn({
+            let usr = usr.clone();
+            let drops = drops.clone();
+            move || usr.send_blocking(Counted(10, drops))
+        });
+        let p2 = loom::thread::spawn({
+            let usr = usr.clone();
+            let drops = drops.clone();
+            move || usr.send_blocking(Counted(20, drops))
+        });
+        drop(rx); // teardown with both producers parked or registering
+        for (handle, id) in [(p1, 10), (p2, 20)] {
+            let err = handle
+                .join()
+                .unwrap()
+                .expect_err("a producer that never linearized must be rejected");
+            assert_eq!(err.0.0, id, "a producer got another producer's payload");
+            drop(err);
+        }
+        drop(usr);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            4,
+            "payload leak or double-drop across teardown"
+        );
     });
 }
 

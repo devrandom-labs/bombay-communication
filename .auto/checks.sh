@@ -63,6 +63,30 @@ else
   echo "CHECK INFO: UserAnchor contract has not landed yet"
 fi
 
+# Frozen blocked-producer teardown contract: a producer blocked on a full
+# user ring when the consumer drops must resolve Err(UserClosed(payload))
+# with its exact payload — the names below pin the oracle so no experiment
+# can quietly delete it.
+teardown_required=(
+  blocked_send_on_full_ring_recovers_exact_payload_on_consumer_drop
+  enqueued_before_teardown_stays_ok_and_teardown_owns_the_payload
+  send_starting_after_teardown_returns_its_payload
+  every_blocked_producer_recovers_its_own_payload
+  blocked_anchor_send_recovers_payload_on_consumer_drop
+  cancelled_blocked_send_drops_payload_exactly_once
+  last_sender_closure_and_user_lane_closed_marker_unchanged
+  drain_with_blocked_producer_preserves_ordering_and_releases_payload
+  drain_teardown_race_releases_blocked_sender_with_payload
+  shutdown_returns_allocations_to_baseline
+  teardown_returns_unlinearized_payloads
+  teardown_releases_multiple_producers_with_their_payloads
+)
+for name in "${teardown_required[@]}"; do
+  rg -q "${name}" crates/fastpass/tests || {
+    echo "CHECK FAIL: missing blocked-producer teardown oracle ${name}"; exit 1;
+  }
+done
+
 if [ "${FASTPASS_DEEP:-0}" = 1 ]; then
   LOOM_MAX_PREEMPTIONS=7 RUSTFLAGS="--cfg loom" \
     cargo test -p fastpass --test loom --release || {

@@ -14,17 +14,12 @@
 //! 2. `recv_future_cancellation_loses_nothing` — bombay's mailbox will
 //!    `select!` over `recv()` plus a shutdown arm, dropping the `recv` future
 //!    mid-park. No item may be lost or duplicated across cancellations.
-//! 3. `drain_teardown_race_discards_blocked_sender_item` — `drain()` returns
-//!    only what is queued (flume `drain` uses `pull_pending(false)`, so a full
-//!    lane never absorbs a parked send). But flume's `disconnect_all` runs
-//!    `pull_pending(false)` AGAIN on receiver drop: a send parked on a full
-//!    lane at teardown completes `Ok(())` while its item is moved into the
-//!    receiverless queue — stranded, neither delivered nor returned. This is a
-//!    flume-level semantic `Consumer` cannot intercept (verified against flume
-//!    0.12.0: `Shared::send` parks, `disconnect_all` pulls, `SendFut::poll`
-//!    reports `Ok` on an emptied hook). The test pins the seam so a flume
-//!    behaviour change is noticed; the limitation is documented on `drain()`
-//!    and recorded in the ADR.
+//! 3. `drain_teardown_race_releases_blocked_sender_with_payload` — `drain()`
+//!    returns only what is QUEUED (a full ring never absorbs a parked send).
+//!    A send parked on the full lane at teardown is RELEASED with its payload:
+//!    the send resolves `Err(UserClosed(item))`, the item is neither in
+//!    `Drained` nor discarded. The linearization rule (ring-slot publish) and
+//!    the full ownership oracle live in `tests/teardown_oracle.rs`.
 //! 4. `default_config_is_pure_strict_priority` — `Config::new` ships
 //!    `aging_cap = 0`: under a control flood users starve. That is a
 //!    deliberate, oracle-fixed default (the P1 test depends on it) — this pins
@@ -136,7 +131,7 @@ async fn recv_future_cancellation_loses_nothing() {
 }
 
 #[tokio::test]
-async fn drain_teardown_race_discards_blocked_sender_item() {
+async fn drain_teardown_race_releases_blocked_sender_with_payload() {
     let (ctl, usr, rx) = channel::<u32, u32>(Config::new(2));
     usr.send(10).await.unwrap();
     usr.send(11).await.unwrap(); // lane now full
@@ -144,8 +139,15 @@ async fn drain_teardown_race_discards_blocked_sender_item() {
         let usr = usr.clone();
         async move { usr.send(12).await }
     });
-    // Let the third send park on the full lane.
-    tokio::time::sleep(Duration::from_millis(25)).await;
+    // Drive the third send to its park on the full lane (bounded yields on a
+    // current-thread runtime — deterministic, not a sleep).
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !blocked.is_finished(),
+        "the third send must be parked on the full ring"
+    );
     ctl.send(7).unwrap();
 
     let drained = rx.drain();
@@ -156,18 +158,15 @@ async fn drain_teardown_race_discards_blocked_sender_item() {
     );
     assert_eq!(drained.control, vec![7], "drain must return queued control");
 
-    // Teardown seam (flume-level, unfixable from Consumer): the parked send is
-    // pulled into the receiverless queue by disconnect_all and reports success;
-    // item 12 is neither in Drained nor returned to the sender. Pin the seam.
-    let returned = timeout(GUARD, blocked)
+    // Teardown releases the parked send with its payload: the send never
+    // linearized (no publish into the ring), so the item comes back as
+    // `UserClosed` — it appears in neither `Drained` nor a black hole.
+    let err = timeout(GUARD, blocked)
         .await
         .expect("blocked sender never released")
-        .unwrap();
-    assert!(
-        returned.is_ok(),
-        "flume pulls parked sends into the orphaned queue at disconnect and reports Ok — \
-         a send racing teardown is silently discarded (documented on drain())"
-    );
+        .unwrap()
+        .expect_err("a send that never linearized must get its payload back");
+    assert_eq!(err.0, 12, "the exact payload must be returned");
 }
 
 #[tokio::test]
