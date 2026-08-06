@@ -42,10 +42,30 @@ usr.try_send(msg)?;          // non-blocking
 match rx.recv().await {      // control-first
     Some(Received::Control(c)) => { /* ... */ }
     Some(Received::User(u))    => { /* ... */ }
+    // One-shot end-marker: every UserSender is gone and the ring drained.
+    // Terminal — delivered exactly once, in the user stream's FIFO position.
+    Some(Received::UserLaneClosed) => { /* drain-stop observability */ }
     None => { /* both lanes closed and drained */ }
 }
+let ctl_only = rx.recv_control().await;  // control lane only, never user items
 let leftover = rx.drain();   // Drained { control, user }, FIFO
 ```
+
+**UserAnchor** — the actorpass address-table endpoint: a non-owning weak
+capability that never keeps the lane open.
+
+```rust
+let anchor = usr.anchor();          // holds no liveness
+if let Some(upgraded) = anchor.upgrade() { /* temporary live sender */ }
+anchor.try_send(msg)?;              // or anchor.send(msg).await
+// Drop every counting UserSender and the lane closes even while the
+// anchor lives — the consumer observes UserLaneClosed and drains to None.
+```
+
+Every anchor delivery first atomically acquires a temporary live `UserSender`
+(one conditional read-modify-write over the live-sender count that never
+increments zero), so a delivery racing the last sender drop either linearizes
+entirely before `UserLaneClosed` or fails with its payload entirely after.
 
 ## The "best possible outcome" algorithm
 
