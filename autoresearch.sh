@@ -1,30 +1,32 @@
 #!/usr/bin/env bash
 # Canonical benchmark entrypoint for the autoresearch loop.
 #
-# Workload: the fastpass perf harness (.auto/measure.sh →
-# `cargo run -q -p fastpass-perf --release`), which merges the control and user
-# lanes of the current design and reports throughput plus control-latency-under-
-# backlog.
+# This session's goal is a CORRECTNESS contract: a user producer blocked on a
+# full ring when the consumer is dropped must resolve Err(UserClosed(payload))
+# with its exact payload, never Ok(()) with the payload discarded (the former
+# "pinned teardown seam"). The harness measures that contract first, then the
+# standing performance score.
 #
-# Primary metric:   score — the composite from .auto/measure.sh (best-of-3,
-#                   normalized-min vs .auto/PERF_BASELINE with per-metric floors
-#                   once the UserAnchor contract lands; 0 while the contract is
-#                   pending, because the perf harness does not emit the
-#                   contract workload lines yet). MAXIMIZE.
+# Primary metric:   contract_green — 1 iff the frozen teardown oracle
+#                   (crates/fastpass/tests/teardown_oracle.rs +
+#                   teardown_alloc.rs) AND the full correctness gate
+#                   (.auto/checks.sh: frozen surfaces, rustfmt, workspace
+#                   tests, strict clippy, bounded Loom) pass; 0 otherwise.
+#                   MAXIMIZE (target 1).
 #
-# Secondary metrics: direct_throughput_ops, anchor_throughput_ops,
-#                   anchor_overhead_ns, control_latency_ns, drain_throughput_ops
-#                   (contract surface, from measure.sh's echoed perf lines);
-#                   throughput_ops, control_latency_ns (legacy surface, reported
-#                   only while the contract is pending — measure.sh cannot parse
-#                   the legacy line names).
+# Secondary metric: score — the composite from .auto/measure.sh (best-of-3,
+#                   normalized-min vs .auto/PERF_BASELINE with per-metric
+#                   floors). Regression guard only: the fix touches no hot
+#                   path, so the score must hold its floors, not improve.
+#                   Plus the perf surface lines measure.sh echoes.
 #
-# Determinism: fixed perf workload, no network, no time-of-day dependence.
-# A compile/runtime failure makes measure.sh emit METRIC score=0, which passes
-# through unchanged so the loop auto-reverts.
+# Determinism: fixed test workloads and fixed perf workload, no network, no
+# time-of-day dependence; the oracle uses barriers/yields and protocol state,
+# never sleeps.
 #
-# Correctness is NOT measured here; .auto/checks.sh is the hard gate
-# (conformance + zero-alloc + frozen files).
+# A harness malfunction exits nonzero; a red contract or a perf build failure
+# exits 0 with the metric reporting the failure (contract_green=0 / score=0),
+# so the loop auto-reverts.
 #
 # Run UNSANDBOXED (cargo hangs under a sandboxed shell).
 set -uo pipefail
@@ -44,7 +46,24 @@ if ! command -v cargo >/dev/null 2>&1; then
 	exit 1
 fi
 export PATH
+for d in /nix/store/*libiconv-1.*/lib; do
+	if [ -d "${d}" ]; then
+		LIBRARY_PATH="${d}${LIBRARY_PATH:+:${LIBRARY_PATH}}"; export LIBRARY_PATH
+		break
+	fi
+done
 
+# 1. Correctness contract: the frozen teardown oracle plus the full gate.
+green=0
+if [ -f crates/fastpass/tests/teardown_oracle.rs ]; then
+	if cargo test -q -p fastpass --test teardown_oracle --test teardown_alloc >/dev/null 2>&1 \
+		&& bash .auto/checks.sh >/dev/null 2>&1; then
+		green=1
+	fi
+fi
+echo "METRIC contract_green=${green}"
+
+# 2. Performance regression guard (same workload as the standing harness).
 out=$(bash .auto/measure.sh 2>&1)
 
 score=$(printf '%s\n' "$out" | grep -oE '^METRIC score=[0-9.]+' | head -n1 | cut -d= -f2)
@@ -56,8 +75,7 @@ fi
 
 echo "METRIC score=${score}"
 
-# Contract-surface secondaries (present once fastpass-perf emits the
-# UserAnchor workload lines; measure.sh echoes them verbatim).
+# Perf-surface secondaries (measure.sh echoes them verbatim).
 while IFS=: read -r src dst; do
 	val=$(printf '%s\n' "$out" | sed -n "s/^${src}=//p" | head -n1)
 	[ -n "${val}" ] && echo "METRIC ${dst}=${val}"
@@ -68,19 +86,5 @@ ANCHOR_OVERHEAD_NS:anchor_overhead_ns
 CONTROL_LATENCY_NS:control_latency_ns
 DRAIN_THROUGHPUT_OPS:drain_throughput_ops
 EOF
-
-# Legacy-surface fallback: while the contract is pending, measure.sh has no
-# contract lines to echo, so report the perf binary's raw legacy lines
-# directly (same fixed workload measure.sh just ran).
-if ! printf '%s\n' "$out" | grep -q '^DIRECT_THROUGHPUT_OPS='; then
-	legacy=$(./target/release/fastpass-perf 2>/dev/null || true)
-	while IFS=: read -r src dst; do
-		val=$(printf '%s\n' "${legacy}" | sed -n "s/^${src}=//p" | head -n1)
-		[ -n "${val}" ] && echo "METRIC ${dst}=${val}"
-	done <<'EOF'
-THROUGHPUT_OPS:throughput_ops
-CONTROL_LATENCY_NS:control_latency_ns
-EOF
-fi
 
 exit 0
