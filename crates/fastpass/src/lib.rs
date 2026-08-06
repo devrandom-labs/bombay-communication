@@ -450,7 +450,10 @@ impl<U> Drop for UserLane<U> {
             let slot = &self.ring[pos & self.mask()];
             if slot.seq.load(Ordering::Relaxed) == (pos as u32).wrapping_add(1) {
                 // SAFETY: published and never consumed; exclusive `&mut self`.
-                unsafe { slot.val.get().drop_in_place() };
+                // `assume_init_drop` drops the CONTENTS — a plain
+                // `drop_in_place` on the `MaybeUninit` drops only the
+                // wrapper, which has no drop glue (payload leak).
+                unsafe { (*slot.val.get()).assume_init_drop() };
             }
         }
     }
@@ -716,7 +719,9 @@ impl<C> Drop for ControlLane<C> {
                 let slot = &block.slots[pos % CBLOCK];
                 if slot.ready.load(Ordering::Relaxed) {
                     // SAFETY: published and never consumed; exclusive ownership.
-                    unsafe { slot.val.get().drop_in_place() };
+                    // `assume_init_drop` drops the CONTENTS — see
+                    // `UserLane::drop`.
+                    unsafe { (*slot.val.get()).assume_init_drop() };
                 }
             }
             b = block.next.load(Ordering::Relaxed); // quiescent: &mut self
@@ -795,8 +800,14 @@ impl<U> Drop for UserSender<U> {
 impl<U> UserSender<U> {
     /// Enqueue a user message, awaiting capacity (backpressure).
     ///
+    /// The send linearizes at the ring-slot publish. If the consumer is
+    /// dropped while this send is blocked on a full ring, teardown releases
+    /// it with its payload — a blocked send never reports success for an
+    /// item that was not enqueued.
+    ///
     /// # Errors
-    /// Returns [`UserClosed`] carrying `item` if the consumer is gone.
+    /// Returns [`UserClosed`] carrying `item` if the consumer is gone —
+    /// including when teardown releases a send blocked on a full ring.
     #[cfg(not(loom))]
     pub async fn send(&self, item: U) -> Result<(), UserClosed<U>> {
         let lane = &self.lane;
@@ -832,14 +843,17 @@ impl<U> UserSender<U> {
             // earlier teardown store; see `wake_consumer`).
             if lane.core.consumer_gone.load(Ordering::Acquire) {
                 lane.waiting.fetch_sub(1, Ordering::Relaxed);
-                // Teardown released us: the send reports success and the item
-                // is discarded — the pinned teardown seam (see `drain`).
-                return Ok(());
+                // Teardown raced the registration seam: the item never
+                // linearized (every push attempt handed it back), so it
+                // returns to the caller, exactly once.
+                return Err(UserClosed(item));
             }
             notified.await;
             lane.waiting.fetch_sub(1, Ordering::Relaxed);
             if lane.core.consumer_gone.load(Ordering::Acquire) {
-                return Ok(());
+                // Teardown released this parked waiter before the item
+                // linearized: return it to the caller, exactly once.
+                return Err(UserClosed(item));
             }
         }
     }
@@ -881,9 +895,9 @@ impl<U> UserSender<U> {
             // Park-gating check (RMW — see `wake_consumer`).
             if lane.core.consumer_gone.load(Ordering::Acquire) {
                 lane.waiting.fetch_sub(1, Ordering::Relaxed);
-                // Teardown released us: the send reports success and the
-                // item is discarded — the pinned teardown seam.
-                return Ok(());
+                // Teardown raced the registration seam: the item never
+                // linearized, so it returns to the caller, exactly once.
+                return Err(UserClosed(item));
             }
             lane.send_notify.enable();
             match lane.try_push(item) {
@@ -896,12 +910,16 @@ impl<U> UserSender<U> {
             }
             if lane.core.consumer_gone.load(Ordering::Acquire) {
                 lane.waiting.fetch_sub(1, Ordering::Relaxed);
-                return Ok(());
+                // Teardown raced the post-registration re-check: the item
+                // never linearized, so it returns to the caller.
+                return Err(UserClosed(item));
             }
             lane.send_notify.wait();
             lane.waiting.fetch_sub(1, Ordering::Relaxed);
             if lane.core.consumer_gone.load(Ordering::Acquire) {
-                return Ok(());
+                // Teardown released this parked waiter before the item
+                // linearized: return it to the caller, exactly once.
+                return Err(UserClosed(item));
             }
         }
     }
@@ -1511,15 +1529,17 @@ impl<C, U> Consumer<C, U> {
     /// Consume the consumer and return everything still queued on both lanes,
     /// in FIFO order (P6 teardown seam).
     ///
-    /// # Teardown race (known limitation)
+    /// # Teardown race
     ///
-    /// Only *queued* items are returned. A `UserSender::send` parked on a full
-    /// lane at this moment completes `Ok` — teardown wakes it and it either
-    /// pushes into the orphaned ring or discards its item — but it appears
-    /// neither here nor back at the sender. Callers needing hard delivery
-    /// guarantees across teardown must stop accepting sends BEFORE draining
-    /// (or treat a send racing `drain` as maybe-undelivered). Pinned by
-    /// `edge_cases::drain_teardown_race_discards_blocked_sender_item`.
+    /// A send's linearization point is the ring-slot publish inside
+    /// `UserLane::try_push`. A `UserSender::send` parked on a full lane at
+    /// this moment is RELEASED with its payload: it never linearized, so it
+    /// resolves `Err(UserClosed(item))` and the item comes back to the
+    /// caller exactly once. A send whose publish completed before it
+    /// observed teardown resolves `Ok(())`; its item is owned by the lane —
+    /// collected here if still queued, or dropped with the lane otherwise.
+    /// Pinned by `tests/teardown_oracle.rs` and
+    /// `edge_cases::drain_teardown_race_releases_blocked_sender_with_payload`.
     #[must_use]
     #[allow(
         clippy::cast_possible_truncation,
@@ -1555,7 +1575,8 @@ impl<C, U> Consumer<C, U> {
     /// Idempotent teardown: flag the consumer gone, publish the consumed
     /// control ticket so the lane's `Drop` reclaims exactly the unconsumed
     /// tail, then release parked user senders (their pending park resolves
-    /// to `Ok`, item discarded) and wake any parked `recv`.
+    /// `Err(UserClosed(item))` — the item never linearized, so it returns
+    /// to the caller) and wake any parked `recv`.
     fn teardown(&self) {
         self.ctl.consumed.store(self.ctl_head, Ordering::Release);
         if self.core.consumer_gone.swap(true, Ordering::AcqRel) {

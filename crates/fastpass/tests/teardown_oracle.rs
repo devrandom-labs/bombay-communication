@@ -223,7 +223,7 @@ async fn every_blocked_producer_recovers_its_own_payload() {
     usr.try_send(Probe::new(1, &drops)).expect("ring empty");
     usr.try_send(Probe::new(2, &drops)).expect("capacity 2");
 
-    let barrier = Arc::new(Barrier::new(PRODUCERS as usize + 1));
+    let barrier = Arc::new(Barrier::new(usize::try_from(PRODUCERS).expect("small") + 1));
     let mut tasks = Vec::new();
     for id in 10..10 + PRODUCERS {
         let usr = usr.clone();
@@ -275,7 +275,10 @@ async fn every_blocked_producer_recovers_its_own_payload() {
     );
 
     drop(usr);
-    assert_eq!(drops.total.load(Ordering::SeqCst), 2 + PRODUCERS as usize);
+    assert_eq!(
+        drops.total.load(Ordering::SeqCst),
+        2 + usize::try_from(PRODUCERS).expect("small")
+    );
     assert_eq!(drops.live.load(Ordering::SeqCst), 0);
 }
 
