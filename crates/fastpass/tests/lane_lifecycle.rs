@@ -38,21 +38,45 @@ async fn anchor_clone_supports_move_only_items() {
     assert_eq!(item.0, 7);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn parked_recv_wakes_with_user_lane_closed_on_last_sender_drop() {
     let (ctl, usr, mut rx) = channel::<u32, u32>(Config::new(8));
-    let b = Arc::new(Barrier::new(2));
-    let b2 = b.clone();
-    let dropper = tokio::spawn(async move {
-        b2.wait().await;
-        // Let `recv` park on the empty channel before the drop lands.
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        drop(usr); // last user sender; the control lane stays open
+    // Two barriers, no sleeps: the first starts both tasks together, the
+    // second releases the drop only after bounded yields on this
+    // current-thread runtime have provably parked `recv` (the assert below
+    // fails otherwise — never a timing guess).
+    let started = Arc::new(Barrier::new(3));
+    let release = Arc::new(Barrier::new(2));
+    let mut recver = tokio::spawn({
+        let started = started.clone();
+        async move {
+            started.wait().await;
+            let got = rx.recv().await;
+            (got, rx)
+        }
     });
-    b.wait().await;
-    let got = timeout(GUARD, rx.recv())
+    let dropper = tokio::spawn({
+        let started = started.clone();
+        let release = release.clone();
+        async move {
+            started.wait().await;
+            release.wait().await;
+            drop(usr); // last user sender; the control lane stays open
+        }
+    });
+    started.wait().await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !recver.is_finished(),
+        "recv resolved before the last-sender drop — this is not the parked path"
+    );
+    release.wait().await;
+    let (got, mut rx) = timeout(GUARD, &mut recver)
         .await
-        .expect("recv parked forever — the last-sender drop did not wake it (lost wakeup)");
+        .expect("recv stalled")
+        .expect("recver task panicked");
     assert!(
         matches!(got, Some(Received::UserLaneClosed)),
         "expected UserLaneClosed, got {got:?} — None would mean the user lane's \
