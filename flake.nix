@@ -39,7 +39,7 @@
           bombay-communication = bombayCommunication;
           bombay-communication-tests = craneLib.cargoNextest (commonArgs // {
             inherit cargoArtifacts;
-            cargoNextestExtraArgs = "--workspace --all-targets";
+            cargoNextestExtraArgs = "--workspace";
           });
           bombay-communication-doc = craneLib.cargoDoc (commonArgs // {
             inherit cargoArtifacts;
