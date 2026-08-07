@@ -30,6 +30,8 @@ jobs:
         run: cargo doc -p bombay-communication --no-deps
         env:
           RUSTDOCFLAGS: --cfg docsrs
+      - name: Add documentation landing page
+        run: cp docs/index.html target/doc/index.html
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
