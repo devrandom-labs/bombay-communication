@@ -1,107 +1,73 @@
-# fastpass
+# Bombay Communication
 
-A generic **priority merge of two FIFO streams into one consumer** — the
-standalone, transport-agnostic distillation of [bombay](../bombay) card #225
-("control-signal lane"): runtime control signals must not queue behind a user
-message backlog.
+Priority-aware, bounded communication channels for Rust.
 
-## The problem
+`bombay-communication` combines an unbounded control lane with a bounded user
+lane behind one consumer. Control traffic can bypass a user backlog, while an
+optional aging cap guarantees that user traffic cannot starve. Each lane
+preserves FIFO order, blocked user producers receive backpressure, and shutdown
+returns queued values without losing ownership.
 
-One consumer, two producer lanes:
+## Install
 
-- a **control** lane (runtime signals: watch/unwatch/supervision) — unbounded,
-  never blocks, rate-bounded by contract;
-- a **user** lane (domain messages) — bounded, with backpressure.
+```toml
+[dependencies]
+bombay-communication = "0.1"
+```
 
-We want *all* of these at once, with no residual downside:
+The package is named `bombay-communication` on crates.io and imported as
+`communication` in Rust.
 
-| Property | Guarantee |
-|---|---|
-| P1 priority | control recv latency is independent of user-queue depth |
-| P2 ordering | FIFO within each lane |
-| P3 progress | user lane never starves — even under a control flood (aging cap) |
-| P4 safety | no loss; every item delivered exactly once |
-| P5 liveness | a parked consumer wakes on arrival in either lane (no lost wakeup) |
-| P6 lifecycle | teardown `drain()` returns queued items on both lanes, in FIFO order |
-| P7 hot path | steady-state `try_send` allocates zero times |
-
-The single, deliberately-accepted relaxation: **there is no cross-lane total
-order** — a control item may overtake an earlier user item. That *is* the
-feature (cf. Erlang/OTP 28 EEP-76 "Priority Messages"). User FIFO-per-sender is
-untouched.
-
-## Public API
+## Example
 
 ```rust
-use fastpass::{channel, Config, Received};
+use communication::{channel, Config, Received};
 
-let (ctl, usr, mut rx) = channel::<Ctl, Msg>(Config::new(1024).with_aging_cap(1024));
-ctl.send(sig)?;              // never blocks
-usr.send(msg).await?;        // bounded backpressure
-usr.try_send(msg)?;          // non-blocking
-match rx.recv().await {      // control-first
-    Some(Received::Control(c)) => { /* ... */ }
-    Some(Received::User(u))    => { /* ... */ }
-    // One-shot end-marker: every UserSender is gone and the ring drained.
-    // Terminal — delivered exactly once, in the user stream's FIFO position.
-    Some(Received::UserLaneClosed) => { /* drain-stop observability */ }
-    None => { /* both lanes closed and drained */ }
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let (control, user, mut receiver) =
+    channel::<&'static str, String>(Config::new(1024).with_aging_cap(64));
+
+control.send("shutdown")?;
+user.send("work item".to_owned()).await?;
+
+match receiver.recv().await {
+    Some(Received::Control(signal)) => println!("control: {signal}"),
+    Some(Received::User(message)) => println!("message: {message}"),
+    Some(Received::UserLaneClosed) => println!("user lane closed"),
+    None => println!("channel closed"),
 }
-let ctl_only = rx.recv_control().await;  // control lane only, never user items
-let leftover = rx.drain();   // Drained { control, user }, FIFO
+# Ok(())
+# }
 ```
 
-**UserAnchor** — the actorpass address-table endpoint: a non-owning weak
-capability that never keeps the lane open.
+## Guarantees
 
-```rust
-let anchor = usr.anchor();          // holds no liveness
-if let Some(upgraded) = anchor.upgrade() { /* temporary live sender */ }
-anchor.try_send(msg)?;              // or anchor.send(msg).await
-// Drop every counting UserSender and the lane closes even while the
-// anchor lives — the consumer observes UserLaneClosed and drains to None.
-```
+- Control receive latency is independent of user-queue depth.
+- FIFO ordering is preserved within each lane.
+- The configurable aging cap prevents user starvation.
+- Values are delivered exactly once and parked consumers cannot miss wakeups.
+- `Consumer::drain` returns remaining values from both lanes in FIFO order.
+- The steady-state user-lane `try_send` path performs no allocations.
+- `UserAnchor` provides a non-owning capability that does not keep a lane open.
 
-Every anchor delivery first atomically acquires a temporary live `UserSender`
-(one conditional read-modify-write over the live-sender count that never
-increments zero), so a delivery racing the last sender drop either linearizes
-entirely before `UserLaneClosed` or fails with its payload entirely after.
+There is intentionally no total order across lanes: a control value may
+overtake an older user value.
 
-## The "best possible outcome" algorithm
+## Development
 
-**Strict priority + anti-starvation aging.** Strict priority gives P1 exactly;
-its only textbook downside — starving the user lane — is neutralised by an aging
-cap `K`: after `K` consecutive control dequeues, one waiting user is forced
-through. Because control is rate-bounded by contract, `K` is never reached in
-normal operation (so P1 is exact), yet the cap bounds a user's worst-case wait
-to `K` control items under an adversarial flood (so P3 is unconditional). Set
-`aging_cap = 0` for pure strict priority.
-
-Built on two flume channels + a biased `select!`, so the wakeup/disconnect
-machinery (P5) is not hand-rolled (bombay ADR-0001).
-
-## Layout
-
-- `crates/fastpass` — the public crate; `Consumer::recv` is the policy under
-  research.
-- `crates/fastpass-reference` — the gold implementation (proves the suite is
-  satisfiable; the benchmark baseline).
-- `crates/fastpass-testkit` — the shared P1–P7 property suite, run against both.
-
-## Test & research
+The project uses the same pinned Rust/Nix development model as Nexus.
 
 ```bash
-cargo test                      # whole workspace (reference + target suites)
-cargo test -p fastpass          # the target crate's suite
-cargo bench -p fastpass         # P1 latency-under-backlog + drain throughput
+nix develop
+cargo test --workspace --all-targets
+nix flake check
 ```
 
-The `Consumer::recv` policy is optimised via an autoresearch loop (see `.auto/`):
-try an idea → `cargo test -p fastpass` → keep if more tests pass, revert if not
-→ repeat. `.auto/checks.sh` forbids weakening the oracle. Once green, the
-component plugs into bombay's mailbox: control lane carries
-watch/unwatch/supervision, user lane carries messages and the in-band stop.
+The workspace retains the production crate, its shared conformance suite, a
+reference implementation, and the performance harness. The support packages
+are unpublished; only `bombay-communication` is released.
 
 ## License
 
-MIT OR Apache-2.0.
+Licensed under either the Apache License, Version 2.0 or the MIT License, at
+your option.

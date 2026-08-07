@@ -1,5 +1,12 @@
-/target
-Cargo.lock
-.auto/log.jsonl
-.auto/state.json
+.direnv/
+result*
+target
+.biscuit/
+**/.env
+**/target
+.env
+.envrc.local
+.worktrees/
+mutants.out/
+mutants.out.old/
 *.profraw

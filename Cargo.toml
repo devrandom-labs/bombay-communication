@@ -1,35 +1,36 @@
-# fastpass — a generic priority-merge of two FIFO streams into one consumer.
-#
-# This is the standalone, transport-agnostic distillation of bombay card #225
-# ("control-signal lane"): runtime control signals must not queue behind a user
-# backlog. Solved here as a self-contained CS component so it can be tested
-# every way and then plugged into bombay's mailbox.
 [workspace]
-resolver = "3"
+resolver = "2"
 members = [
-  "crates/fastpass",
-  "crates/fastpass-reference",
-  "crates/fastpass-testkit",
-  "crates/fastpass-perf",
+    "crates/communication",
+    "crates/communication-perf",
+    "crates/communication-reference",
+    "crates/communication-testkit",
 ]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.95.0"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/devrandom-labs/fastpass"
+authors = ["Joel DSouza <joel@devrandom.co>"]
+repository = "https://github.com/devrandom-labs/bombay-communication"
+homepage = "https://devrandom-labs.github.io/bombay-communication/"
 
 [workspace.dependencies]
+communication = { package = "bombay-communication", path = "crates/communication" }
+communication-reference = { package = "bombay-communication-reference", path = "crates/communication-reference" }
+communication-testkit = { package = "bombay-communication-testkit", path = "crates/communication-testkit" }
+criterion = { version = "0.8", features = ["async_tokio"] }
 flume = "0.12"
+loom = "0.7"
+parking_lot = "0.12"
+proptest = "1.11"
 thiserror = "2.0"
 tokio = { version = "1.47", default-features = false }
-criterion = { version = "0.8", features = ["async_tokio"] }
-fastpass = { path = "crates/fastpass" }
-fastpass-reference = { path = "crates/fastpass-reference" }
-fastpass-testkit = { path = "crates/fastpass-testkit" }
 
-# Keep the research crates lint-honest without importing bombay's full god-tier
-# config — this is a spike, but the invariants are real.
-[workspace.lints.clippy]
-all = { level = "deny", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
+[workspace.metadata.crane]
+name = "bombay-communication"

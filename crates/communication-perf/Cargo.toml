@@ -1,0 +1,26 @@
+[package]
+name = "bombay-communication-perf"
+description = "Performance harness for bombay-communication"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+[[bin]]
+name = "bombay-communication-perf"
+path = "src/main.rs"
+
+[dependencies]
+communication = { workspace = true }
+tokio = { workspace = true, features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "sync",
+] }
+
+[lints]
+workspace = true

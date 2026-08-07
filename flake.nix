@@ -1,75 +1,85 @@
 {
-  description = "fastpass — two-lane priority merge (bombay card #225)";
+  description = "Priority-aware communication channels for Rust";
+
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     utils.url = "github:numtide/flake-utils";
+    crane.url = "github:ipetkov/crane";
     fenix = {
       url = "github:nix-community/fenix";
-      inputs = {
-        nixpkgs.follows = "nixpkgs";
-      };
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    advisory-db = {
+      url = "github:rustsec/advisory-db";
+      flake = false;
     };
   };
-  outputs =
-    {
-      self,
-      nixpkgs,
-      utils,
-      fenix,
-      ...
-    }:
-    utils.lib.eachDefaultSystem (
-      system:
+
+  outputs = { self, nixpkgs, utils, crane, fenix, advisory-db, ... }:
+    utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-
-        # STABLE, pinned toolchain — read from rust-toolchain.toml so Nix and
-        # plain rustup resolve the SAME toolchain (bombay card #60 pattern).
-        # The sha256 covers the channel manifest (system-independent).
-        toolchain = fenix.packages.${system}.fromToolchainFile {
+        rustToolchain = fenix.packages.${system}.fromToolchainFile {
           file = ./rust-toolchain.toml;
-          sha256 = "sha256-mvUGEOHYJpn3ikC5hckneuGixaC+yGrkMM/liDIDgoU=";
+          sha256 = "sha256-gh/xTkxKHL4eiRXzWv8KP7vfjSk61Iq48x47BEDFgfk=";
+        };
+        craneLib = (crane.mkLib pkgs).overrideToolchain (_: rustToolchain);
+        src = craneLib.cleanCargoSource ./.;
+        commonArgs = {
+          inherit src;
+          strictDeps = true;
+        };
+        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+        bombayCommunication = craneLib.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
+          cargoExtraArgs = "--package bombay-communication";
+        });
+      in {
+        checks = {
+          bombay-communication = bombayCommunication;
+          bombay-communication-tests = craneLib.cargoNextest (commonArgs // {
+            inherit cargoArtifacts;
+            cargoNextestExtraArgs = "--workspace --all-targets";
+          });
+          bombay-communication-doc = craneLib.cargoDoc (commonArgs // {
+            inherit cargoArtifacts;
+            cargoDocExtraArgs = "--workspace --no-deps";
+          });
+          bombay-communication-fmt = craneLib.cargoFmt { inherit src; };
+          bombay-communication-toml-fmt = craneLib.taploFmt {
+            src = pkgs.lib.sources.sourceFilesBySuffices src [ ".toml" ];
+          };
+          bombay-communication-audit = craneLib.cargoAudit { inherit src advisory-db; };
+          bombay-communication-deny = craneLib.cargoDeny { inherit src; };
         };
 
-        # Nightly toolchain for the on-demand MIRI lane (bombay card #150
-        # pattern). NOT a build toolchain, kept out of the default shell.
-        # MIRI is the only tool that can see this crate's concurrency: loom
-        # requires code under test to opt in (`cfg(loom)`), and flume — which
-        # owns the channel internals — ships no such instrumentation. MIRI is
-        # an interpreter, so it executes flume's real std::sync atomics.
-        miriToolchain =
-          (fenix.packages.${system}.toolchainOf {
-            channel = "nightly";
-            date = "2026-06-15";
-            sha256 = "sha256-oXipquOa/9M0uuo8wGuRaY2+ZqLGywZOOnRK05Mm0a0=";
-          }).withComponents
-            [
-              "cargo"
-              "rustc"
-              "rust-src"
-              "rust-std"
-              "miri"
-            ];
-      in
-      {
-        devShells.default = pkgs.mkShell {
-          packages = [
-            toolchain
-            pkgs.cargo-edit
-            pkgs.cargo-expand
-            pkgs.cargo-nextest
+        packages.default = bombayCommunication;
+
+        devShells.default = craneLib.devShell {
+          checks = self.checks.${system};
+          shellHook = ''
+            git config core.hooksPath .githooks
+            REPO_NAME=$(basename "$PWD")
+            PROPER_REPO_NAME=$(echo "$REPO_NAME" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')
+            figlet -f doom "$PROPER_REPO_NAME" | lolcat -a -d 2
+            cowsay -f dragon-and-cow "Welcome to the $PROPER_REPO_NAME development environment on ${system}!" | lolcat
+          '';
+          packages = with pkgs; [
+            fenix.packages.${system}.rust-analyzer
+            bacon
+            cargo-nextest
+            cargo-edit
+            cargo-deny
+            cargo-audit
+            taplo
+            figlet
+            lolcat
+            cowsay
+            tmux
+            tree
+            cloc
+            gh
           ];
         };
-
-        # `nix develop .#miri` — the MIRI lane's toolchain, on demand.
-        devShells.miri = pkgs.mkShell {
-          packages = [ miriToolchain ];
-          shellHook = ''
-            echo "fastpass MIRI shell — nightly, on-demand only."
-            echo "  cargo miri setup"
-            echo "  MIRIFLAGS=\"-Zmiri-many-seeds=..8\" cargo miri test -p fastpass"
-          '';
-        };
-      }
-    );
+      });
 }

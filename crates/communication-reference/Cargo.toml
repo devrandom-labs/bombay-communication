@@ -1,0 +1,33 @@
+[package]
+name = "bombay-communication-reference"
+description = "Reference implementation for bombay-communication"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lib]
+name = "communication_reference"
+
+[dependencies]
+flume = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros"] }
+
+[dev-dependencies]
+communication-testkit = { workspace = true }
+parking_lot.workspace = true
+tokio = { workspace = true, features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "time",
+    "sync",
+] }
+
+[lints]
+workspace = true
