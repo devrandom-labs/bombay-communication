@@ -61,7 +61,7 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "bombay-communication"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bombay-communication-testkit",
  "criterion",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "bombay-communication-perf"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bombay-communication",
  "tokio",
@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "bombay-communication-reference"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bombay-communication-testkit",
  "flume",
@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "bombay-communication-testkit"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "bumpalo"
