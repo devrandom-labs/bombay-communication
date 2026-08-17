@@ -975,6 +975,82 @@ pub struct UserAnchor<U> {
     lane: Arc<UserLane<U>>,
 }
 
+/// Affine authority over user-message admission for an actor mailbox.
+///
+/// Unlike [`UserSender`], this capability is deliberately not cloneable and
+/// does not expose a counting sender. Cloneable addresses are obtained as
+/// [`MailboxRef`]s instead. Consuming this owner with
+/// [`MailboxOwner::close_admission`] prevents every stale reference from
+/// acquiring a new delivery permit while allowing permits acquired before
+/// the close to finish. The consumer can then receive every accepted message
+/// followed by [`Received::UserLaneClosed`].
+///
+/// Dropping the owner has the same admission-closing effect. The explicit
+/// method is preferred at graceful-retirement sites because it documents the
+/// lifecycle transition.
+#[must_use = "dropping the mailbox owner closes user-message admission"]
+pub struct MailboxOwner<U> {
+    sender: UserSender<U>,
+}
+
+impl<U> MailboxOwner<U> {
+    /// Create another non-owning, cloneable address for this mailbox.
+    #[must_use]
+    pub fn actor_ref(&self) -> MailboxRef<U> {
+        MailboxRef {
+            anchor: self.sender.anchor(),
+        }
+    }
+
+    /// Atomically close admission with respect to deliveries through every
+    /// [`MailboxRef`], including stale clones.
+    ///
+    /// A racing delivery has exactly one of two outcomes: it acquired a
+    /// temporary sender before this close and must be received before the
+    /// terminal marker, or it receives its original payload back as closed.
+    /// This operation does not destroy the consumer or discard queued work.
+    pub fn close_admission(self) {
+        drop(self);
+    }
+}
+
+/// Cloneable, non-owning actor address governed by a [`MailboxOwner`].
+///
+/// Each send acquires exactly one temporary admission permit. Unlike
+/// [`UserAnchor`], this restricted address deliberately does not expose that
+/// permit as a [`UserSender`], so code holding stale references cannot retain
+/// or clone admission beyond an individual delivery operation.
+pub struct MailboxRef<U> {
+    anchor: UserAnchor<U>,
+}
+
+impl<U> Clone for MailboxRef<U> {
+    fn clone(&self) -> Self {
+        Self {
+            anchor: self.anchor.clone(),
+        }
+    }
+}
+
+impl<U> MailboxRef<U> {
+    /// Deliver one message, awaiting bounded-lane capacity.
+    ///
+    /// Returns the original message if admission was already closed or the
+    /// consumer disappeared before the message was accepted.
+    #[cfg(not(loom))]
+    pub async fn send(&self, item: U) -> Result<(), UserClosed<U>> {
+        self.anchor.send(item).await
+    }
+
+    /// Try to deliver one message without waiting for capacity.
+    ///
+    /// A close racing this call either follows the accepted message in the
+    /// receive stream or wins and returns the original message as closed.
+    pub fn try_send(&self, item: U) -> Result<(), TrySendError<U>> {
+        self.anchor.try_send(item)
+    }
+}
+
 impl<U> Clone for UserAnchor<U> {
     fn clone(&self) -> Self {
         Self {
@@ -1664,4 +1740,28 @@ pub fn channel<C, U>(cfg: Config) -> (ControlSender<C>, UserSender<U>, Consumer<
             usr_closed_reported: false,
         },
     )
+}
+
+/// Build an actor-oriented channel with affine admission ownership.
+///
+/// The returned [`MailboxOwner`] is the sole durable user-lane sender.
+/// External addresses are restricted [`MailboxRef`]s and therefore neither
+/// keep the mailbox open, retain admission permits, nor resurrect the mailbox
+/// after retirement. Call
+/// [`MailboxOwner::close_admission`], continue receiving until
+/// [`Received::UserLaneClosed`], and finally drop the control sender when no
+/// further lifecycle traffic can arrive; [`Consumer::recv`] then drains to
+/// `None`.
+pub fn mailbox_channel<C, U>(
+    cfg: Config,
+) -> (
+    ControlSender<C>,
+    MailboxOwner<U>,
+    MailboxRef<U>,
+    Consumer<C, U>,
+) {
+    let (control, sender, consumer) = channel(cfg);
+    let owner = MailboxOwner { sender };
+    let actor_ref = owner.actor_ref();
+    (control, owner, actor_ref, consumer)
 }

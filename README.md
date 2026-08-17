@@ -49,6 +49,8 @@ match receiver.recv().await {
 - `Consumer::drain` returns remaining values from both lanes in FIFO order.
 - The steady-state user-lane `try_send` path performs no allocations.
 - `UserAnchor` provides a non-owning capability that does not keep a lane open.
+- `mailbox_channel` provides an affine admission owner for graceful actor
+  retirement while stale, non-owning addresses remain usable as closed refs.
 
 There is intentionally no total order across lanes: a control value may
 overtake an older user value.
