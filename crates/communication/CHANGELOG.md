@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/devrandom-labs/bombay-communication/compare/bombay-communication-v0.1.1...bombay-communication-v0.1.2) - 2026-08-17
+
+### Added
+
+- add affine mailbox retirement ([#3](https://github.com/devrandom-labs/bombay-communication/pull/3))
+
 ## [0.1.1](https://github.com/devrandom-labs/bombay-communication/compare/bombay-communication-v0.1.0...bombay-communication-v0.1.1) - 2026-08-07
 
 ### Other
