@@ -1,0 +1,36 @@
+# cargo-deny scans dependencies for known advisories (RustSec) and license
+# policy. The nix/crane gate already runs the same `cargo deny check`; this
+# standalone workflow gives the checks their own badge and a weekly scheduled
+# run, so newly-published advisories surface even when nothing changes.
+name: Cargo Deny
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  schedule:
+    # Weekly, Mondays 05:37 UTC (staggered from the CodeQL cron).
+    - cron: "37 5 * * 1"
+
+# Don't pile up redundant scans on rapid pushes.
+concurrency:
+  group: deny-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deny:
+    name: Advisories & Licenses
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check advisories and licenses
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
