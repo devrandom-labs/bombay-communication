@@ -47,4 +47,6 @@ jobs:
           purge-primary-key: never
 
       - name: Flake Check
-        run: nix flake check
+        # -L: print full build logs so a failing crane derivation surfaces its
+        # actual error instead of the truncated "last 10 lines" default.
+        run: nix flake check -L
