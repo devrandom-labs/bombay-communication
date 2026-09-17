@@ -1,0 +1,29 @@
+branches:
+  defaultBase: main
+sandbox:
+  refuse:
+    - name: github-actions
+      hint: |-
+        Blocks commands that trigger or run GitHub Actions: workflow dispatch
+        (gh workflow run), run re-execution (gh run rerun), local runners
+        (act, nektos/act), the ob pr rerun CLI wrapper (spawns gh run rerun
+        as a child process), and dispatch/rerun endpoints — Actions API and
+        repository dispatch — via gh api or curl. Security-first default
+        against the common paths, not a hard boundary: repo owners re-allow
+        by editing or removing this rule in .obvious/config.yml via PR.
+      patterns:
+        - exact: gh workflow run
+        - exact: gh run rerun
+        - exact: act
+        - exact: ob pr rerun
+        - exact: bun ob pr rerun
+        - exact: bun obvious pr rerun
+        - regex: nektos/act
+        - regex: \bgh workflow run\b
+        - regex: \bgh run rerun\b
+        - regex: (?:^|[\s;|&])(?:[\w./-]*/)?act(?:\s|$)
+        - regex: actions/(workflows/[^ ]*/dispatches|runs/[^ ]*/rerun|jobs/[^ ]*/rerun)
+        - regex: repos/[^ ]*/dispatches
+pr:
+  merge:
+    method: squash
