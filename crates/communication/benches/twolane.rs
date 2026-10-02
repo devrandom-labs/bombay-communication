@@ -2,7 +2,7 @@
 //! recv latency while the user lane is saturated — it must stay flat as the
 //! backlog grows. A second bench measures drain throughput.
 
-use communication::{Config, Received, channel};
+use communication::{Config, Received, channel, mailbox_channel};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use tokio::runtime::Runtime;
@@ -250,11 +250,126 @@ fn producer_contention(c: &mut Criterion) {
     group.finish();
 }
 
+// Compare restricted mailbox admission with the unchanged raw anchor on
+// exactly the same ring/consumer, excluding construction from measurement.
+fn mailbox_admission(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("mailbox_admission");
+    group.bench_function("owner_reference_1024", |b| {
+        b.to_async(&rt).iter_batched(
+            || mailbox_channel::<(), u32>(Config::new(1024)),
+            |(control, owner, mailbox, mut receiver)| async move {
+                for value in 0..1024 {
+                    mailbox.try_send(value).unwrap();
+                }
+                for _ in 0..1024 {
+                    black_box(receiver.recv().await);
+                }
+                black_box((control, owner, mailbox, receiver))
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("raw_anchor_1024", |b| {
+        b.to_async(&rt).iter_batched(
+            || channel::<(), u32>(Config::new(1024)),
+            |(control, sender, mut receiver)| async move {
+                let anchor = sender.anchor();
+                for value in 0..1024 {
+                    anchor.try_send(value).unwrap();
+                }
+                for _ in 0..1024 {
+                    black_box(receiver.recv().await);
+                }
+                black_box((control, sender, anchor, receiver))
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
+fn mailbox_control_latency_under_backlog(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("mailbox_control_latency_under_backlog");
+    for depth in [0usize, 64, 1024, 8192] {
+        group.bench_with_input(BenchmarkId::from_parameter(depth), &depth, |b, &depth| {
+            b.to_async(&rt).iter_batched(
+                || {
+                    let (control, owner, mailbox, receiver) =
+                        mailbox_channel::<u32, u32>(Config::new(depth.max(1)));
+                    for value in 0..depth {
+                        mailbox.try_send(u32::try_from(value).unwrap()).unwrap();
+                    }
+                    control.send(1).unwrap();
+                    (control, owner, mailbox, receiver)
+                },
+                |(control, owner, mailbox, mut receiver)| async move {
+                    let event = receiver.recv().await;
+                    assert!(matches!(&event, Some(Received::Control(1))));
+                    black_box((control, owner, mailbox, receiver))
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+fn mailbox_producer_contention(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    c.bench_function("mailbox_producer_contention_2p_40k", |b| {
+        b.to_async(&runtime).iter(|| async {
+            let (control, owner, mailbox, mut receiver) =
+                mailbox_channel::<u32, u32>(Config::new(4096));
+            let mut producers = Vec::new();
+            for _ in 0..2 {
+                let control = control.clone();
+                let mailbox = mailbox.clone();
+                producers.push(tokio::spawn(async move {
+                    for value in 0..CONTENTION_ITEMS_PER_LANE {
+                        control.send(value).unwrap();
+                        mailbox.send(value).await.unwrap();
+                    }
+                }));
+            }
+            for _ in 0..CONTENTION_ITEMS_PER_LANE * 4 {
+                let event = receiver.recv().await;
+                match event {
+                    Some(Received::Control(value) | Received::User(value)) => {
+                        black_box(value);
+                    }
+                    Some(Received::UserLaneClosed) | None => {
+                        panic!("durable owner closed before producers completed")
+                    }
+                }
+            }
+            for producer in producers {
+                producer.await.unwrap();
+            }
+            owner.close_admission();
+            drop(control);
+            let terminal = receiver.recv().await;
+            let exhausted = receiver.recv().await;
+            assert!(matches!(&terminal, Some(Received::UserLaneClosed)));
+            assert_eq!(exhausted, None);
+            black_box((mailbox, receiver))
+        });
+    });
+}
+
 criterion_group!(
     benches,
     control_latency_under_backlog,
     control_latency_under_backlog_one_struct,
     drain_throughput,
-    producer_contention
+    producer_contention,
+    mailbox_admission,
+    mailbox_control_latency_under_backlog,
+    mailbox_producer_contention
 );
 criterion_main!(benches);

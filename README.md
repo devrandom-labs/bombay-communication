@@ -52,6 +52,14 @@ match receiver.recv().await {
 - `mailbox_channel` provides an affine admission owner for graceful actor
   retirement while stale, non-owning addresses remain usable as closed refs.
 
+Mailbox admission closes independently of raw sender liveness. Operations that
+acquired a temporary sender before owner closure can finish; later operations
+recover their exact original payload as closed. The mailbox adds one shared
+admission allocation at construction and a short mutex acquisition per send.
+Raw `channel`, `UserSender`, and `UserAnchor` retain their existing semantics.
+See [Mailbox admission](docs/mailbox-admission.md) for closure, cancellation,
+allocation, and performance evidence.
+
 There is intentionally no total order across lanes: a control value may
 overtake an older user value.
 

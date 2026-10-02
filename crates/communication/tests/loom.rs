@@ -37,7 +37,7 @@
 //! communication --test loom --release`.
 #![cfg(loom)]
 
-use communication::{Config, Received, channel};
+use communication::{Config, Received, TrySendError, channel, mailbox_channel};
 use loom::sync::atomic::Ordering;
 
 #[test]
@@ -504,5 +504,38 @@ fn anchor_release_before_publish_marker_ordering() {
         fused.join().unwrap();
         assert!(marker_seen, "lane never closed");
         assert_eq!(items, vec![42], "delivered item missing from the stream");
+    });
+}
+
+#[test]
+fn mailbox_close_racing_acquisition_preserves_exact_stream() {
+    loom::model(|| {
+        let (control, owner, mailbox, mut receiver) = mailbox_channel::<(), u32>(Config::new(2));
+        let stale = mailbox.clone();
+        let delivery = loom::thread::spawn(move || mailbox.try_send(11));
+        owner.close_admission();
+        let denied = stale.try_send(17);
+        match denied {
+            Err(TrySendError::Closed(payload)) => assert_eq!(payload, 17),
+            Err(TrySendError::Full(payload)) => panic!("closed admission reported full: {payload}"),
+            Ok(()) => panic!("new delivery entered closed admission"),
+        }
+        let raced = delivery.join().unwrap();
+        drop(control);
+        let mut trace = Vec::new();
+        while let Some(event) = receiver.recv_blocking() {
+            trace.push(event);
+        }
+        let expected = match raced {
+            Ok(()) => vec![Received::User(11), Received::UserLaneClosed],
+            Err(TrySendError::Closed(payload)) => {
+                assert_eq!(payload, 11);
+                vec![Received::UserLaneClosed]
+            }
+            Err(TrySendError::Full(payload)) => panic!("empty mailbox reported full: {payload}"),
+        };
+        assert_eq!(trace, expected);
+        let replay = receiver.recv_blocking();
+        assert_eq!(replay, None);
     });
 }
