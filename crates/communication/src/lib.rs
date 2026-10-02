@@ -32,17 +32,17 @@
 //! depends on these exact names and signatures.
 
 use std::fmt;
-use std::mem::MaybeUninit;
+use std::mem::{MaybeUninit, replace};
 
 #[cfg(not(loom))]
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 #[cfg(not(loom))]
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 #[cfg(loom)]
-use loom::sync::Arc;
-#[cfg(loom)]
 use loom::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+#[cfg(loom)]
+use loom::sync::{Arc, Mutex};
 
 #[cfg(not(loom))]
 use tokio::sync::Notify;
@@ -990,16 +990,27 @@ pub struct UserAnchor<U> {
 /// lifecycle transition.
 #[must_use = "dropping the mailbox owner closes user-message admission"]
 pub struct MailboxOwner<U> {
-    sender: UserSender<U>,
+    admission: Arc<Mutex<MailboxAdmission<U>>>,
+}
+
+/// Admission is independent of the sender count: already acquired permits
+/// retain their sender while this owner closes every subsequent acquisition.
+/// Critical sections contain only enum replacement and sender cloning: no
+/// user code, payload destruction, or await can unwind while holding the lock.
+enum MailboxAdmission<U> {
+    Open(UserSender<U>),
+    Closed,
 }
 
 impl<U> MailboxOwner<U> {
     /// Create another non-owning, cloneable address for this mailbox.
     #[must_use]
     pub fn actor_ref(&self) -> MailboxRef<U> {
-        MailboxRef {
-            anchor: self.sender.anchor(),
-        }
+        #[cfg(not(loom))]
+        let admission = Arc::downgrade(&self.admission);
+        #[cfg(loom)]
+        let admission = self.admission.clone();
+        MailboxRef { admission }
     }
 
     /// Atomically close admission with respect to deliveries through every
@@ -1014,6 +1025,18 @@ impl<U> MailboxOwner<U> {
     }
 }
 
+impl<U> Drop for MailboxOwner<U> {
+    fn drop(&mut self) {
+        let retired_admission = {
+            let mut admission = self.admission.lock().expect("mailbox admission poisoned");
+            replace(&mut *admission, MailboxAdmission::Closed)
+        };
+        // Final lane destruction can drop queued user payloads; release the
+        // admission lock before dropping the durable sender and its lane.
+        drop(retired_admission);
+    }
+}
+
 /// Cloneable, non-owning actor address governed by a [`MailboxOwner`].
 ///
 /// Each send acquires exactly one temporary admission permit. Unlike
@@ -1021,25 +1044,45 @@ impl<U> MailboxOwner<U> {
 /// permit as a [`UserSender`], so code holding stale references cannot retain
 /// or clone admission beyond an individual delivery operation.
 pub struct MailboxRef<U> {
-    anchor: UserAnchor<U>,
+    #[cfg(not(loom))]
+    admission: Weak<Mutex<MailboxAdmission<U>>>,
+    #[cfg(loom)]
+    admission: Arc<Mutex<MailboxAdmission<U>>>,
 }
 
 impl<U> Clone for MailboxRef<U> {
     fn clone(&self) -> Self {
         Self {
-            anchor: self.anchor.clone(),
+            admission: self.admission.clone(),
         }
     }
 }
 
 impl<U> MailboxRef<U> {
+    fn acquire_sender(&self) -> Option<UserSender<U>> {
+        #[cfg(not(loom))]
+        let admission = self.admission.upgrade()?;
+        #[cfg(loom)]
+        let admission = self.admission.clone();
+        let sender = match &*admission.lock().expect("mailbox admission poisoned") {
+            MailboxAdmission::Open(sender) => Some(sender.clone()),
+            MailboxAdmission::Closed => None,
+        };
+        // The lock and promoted admission Arc are gone before any delivery
+        // awaits capacity; only the exact acquired UserSender remains live.
+        sender
+    }
+
     /// Deliver one message, awaiting bounded-lane capacity.
     ///
     /// Returns the original message if admission was already closed or the
     /// consumer disappeared before the message was accepted.
     #[cfg(not(loom))]
     pub async fn send(&self, item: U) -> Result<(), UserClosed<U>> {
-        self.anchor.send(item).await
+        let Some(sender) = self.acquire_sender() else {
+            return Err(UserClosed(item));
+        };
+        sender.send(item).await
     }
 
     /// Try to deliver one message without waiting for capacity.
@@ -1047,7 +1090,10 @@ impl<U> MailboxRef<U> {
     /// A close racing this call either follows the accepted message in the
     /// receive stream or wins and returns the original message as closed.
     pub fn try_send(&self, item: U) -> Result<(), TrySendError<U>> {
-        self.anchor.try_send(item)
+        let Some(sender) = self.acquire_sender() else {
+            return Err(TrySendError::Closed(item));
+        };
+        sender.try_send(item)
     }
 }
 
@@ -1761,7 +1807,38 @@ pub fn mailbox_channel<C, U>(
     Consumer<C, U>,
 ) {
     let (control, sender, consumer) = channel(cfg);
-    let owner = MailboxOwner { sender };
+    let owner = MailboxOwner {
+        admission: Arc::new(Mutex::new(MailboxAdmission::Open(sender))),
+    };
     let actor_ref = owner.actor_ref();
     (control, owner, actor_ref, consumer)
+}
+
+#[cfg(test)]
+mod mailbox_admission_tests {
+    use super::{Config, TrySendError, mailbox_channel};
+
+    #[test]
+    fn promoted_reference_cannot_extend_owner_admission() {
+        let observe_closed_admission = || {
+            let (control, owner, mailbox, receiver) = mailbox_channel::<(), u32>(Config::new(2));
+            // Model a reference paused after promoting allocation liveness,
+            // before taking the admission lock. Promotion is not authority.
+            let promoted = owner.admission.clone();
+            owner.close_admission();
+            let rejected = mailbox.try_send(23);
+            match rejected {
+                Err(TrySendError::Closed(payload)) => assert_eq!(payload, 23),
+                Err(TrySendError::Full(payload)) => {
+                    panic!("closed admission reported full: {payload}")
+                }
+                Ok(()) => panic!("promoted allocation retained admission after owner close"),
+            }
+            drop((promoted, control, receiver));
+        };
+        #[cfg(loom)]
+        loom::model(observe_closed_admission);
+        #[cfg(not(loom))]
+        observe_closed_admission();
+    }
 }
