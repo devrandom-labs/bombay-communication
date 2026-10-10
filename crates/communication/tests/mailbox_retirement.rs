@@ -21,20 +21,34 @@ async fn close_rejects_stale_refs_with_the_exact_payload_and_drains_accepted_wor
     actor_ref.try_send(MoveOnly(2)).unwrap();
     owner.close_admission();
 
-    match stale.try_send(MoveOnly(3)) {
-        Err(TrySendError::Closed(value)) => assert_eq!(value, MoveOnly(3)),
-        Err(TrySendError::Full(_)) => panic!("closed mailbox reported full"),
-        Ok(()) => panic!("stale ref admitted a message after close"),
+    let try_closed = stale
+        .try_send(MoveOnly(3))
+        .expect_err("stale ref cannot admit a message after close");
+    let try_description = try_closed.to_string();
+    match try_closed {
+        TrySendError::Closed(value) => assert_eq!(value, MoveOnly(3)),
+        TrySendError::Full(_) => panic!("closed mailbox reported full"),
     }
-    let UserClosed(value) = stale.send(MoveOnly(4)).await.unwrap_err();
+    let user_closed = stale.send(MoveOnly(4)).await.unwrap_err();
+    let user_description = user_closed.to_string();
+    let UserClosed(value) = user_closed;
     assert_eq!(value, MoveOnly(4));
 
-    assert_eq!(receiver.recv().await, Some(Received::User(MoveOnly(1))));
-    assert_eq!(receiver.recv().await, Some(Received::User(MoveOnly(2))));
-    assert_eq!(receiver.recv().await, Some(Received::UserLaneClosed));
-
+    let first = receiver.recv().await;
+    let second = receiver.recv().await;
+    let terminal = receiver.recv().await;
     drop(control);
-    assert_eq!(receiver.recv().await, None);
+    let exhausted = receiver.recv().await;
+    let trace = [first, second, terminal, exhausted];
+    let expected = [
+        Some(Received::User(MoveOnly(1))),
+        Some(Received::User(MoveOnly(2))),
+        Some(Received::UserLaneClosed),
+        None,
+    ];
+    assert_eq!(trace, expected);
+    assert_eq!(try_description, "user lane closed");
+    assert_eq!(user_description, "user lane closed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
