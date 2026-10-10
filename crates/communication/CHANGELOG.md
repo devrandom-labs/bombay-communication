@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/devrandom-labs/bombay-communication/compare/bombay-communication-v0.1.3...bombay-communication-v0.1.4) - 2026-10-10
+
+### Fixed
+
+- report user admission closure without implying consumer drop
+
 ## [0.1.3](https://github.com/devrandom-labs/bombay-communication/compare/bombay-communication-v0.1.2...bombay-communication-v0.1.3) - 2026-10-02
 
 ### Fixed
