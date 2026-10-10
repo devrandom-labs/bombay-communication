@@ -43,6 +43,60 @@ the operating system; this implementation promises no bounded closure time.
 
 ## Verification
 
+### User-closure diagnostic correction
+
+The diagnostic law is that a rejected user delivery must report closure without
+claiming that the consumer was dropped. Explicit mailbox-admission closure can
+return `UserClosed` or `TrySendError::Closed` while the same consumer drains the
+entire accepted prefix and then its terminal marker.
+
+Before the production edit, the bounded correction covers only the two user
+error descriptions and their Display strings in `crates/communication/src/lib.rs`
+(at most eight net Rust documentation/text lines), the existing closure
+regression in `crates/communication/tests/mailbox_retirement.rs` (at most 45 net
+test lines), and this owning record. The original test will assert both strings
+as `user lane closed` after observing the complete live-consumer drain. Restoring
+each original string separately must fail its intended assertion in debug and
+optimized builds, followed by byte-exact source restoration and passing controls.
+
+The existing error variants, original payload recovery, admission owner,
+mailbox, and complete receive trace are reused. No public type, dependency,
+delivery implementation, resource limit, or version changes. `ControlClosed`
+keeps its consumer-disappearance wording. Compilation, runtime tests, formatting,
+and strict linting use Bombay's pinned Nix shell; owning Linux CI remains required
+before delivery. The selected baseline is commit
+`272a2343187b40615ab26c2d0d2e136010a16e77`.
+
+Verification on 2026-10-10 establishes the original diagnostic failure in both
+debug and optimized builds, after the complete accepted-prefix drain. Corrected
+controls pass in both builds. Restoring only `UserClosed`'s original Display
+fails its own assertion; restoring only `TrySendError::Closed`'s original Display
+fails the other assertion, in both builds. Each mutation is followed by
+byte-exact production-source restoration and passing controls. The restored
+source SHA-256 is
+`003b01d35f0589a799ebcf24dde53637b8de0fe3f7423dd542e18f0a8928870e`.
+
+Bombay's pinned Rust 1.99 runs all 84 workspace tests successfully in debug and
+optimized builds; the optimized command selects libraries, integration tests,
+and binaries. Workspace documentation testing succeeds with zero executed
+tests and one existing ignored example. An attempted optimized all-target run
+was interrupted while its inherited `OneStruct` Criterion comparison stalled;
+that attempt is incomplete, not a passing benchmark campaign. No benchmark
+code or delivery behavior was changed.
+
+The owner's exact pinned Nix Rust 1.95.0 passes workspace formatting and strict
+Clippy across all targets without Rust warnings. Rust 1.99's strict lint attempt
+fails the inherited `AtomicUsize::fetch_update` deprecation, which was also
+present before this correction. No suppression, atomic implementation change,
+minimum-version change, or workflow change was made. Required Linux Nix CI and
+independent review remain necessary; this record does not claim merge or release.
+
+Complete tracked and untracked accounting: three existing changed paths and
+no untracked paths; production Rust documentation/text +6/-4/net +2; owning
+tests +24/-10/net +14; public types +0/-0; manifests, locks, and version unchanged.
+Owning guidance adds 54 lines; there are no other retained source changes.
+Only the two user-error diagnostics and their documentation changed in production.
+
 The owning regressions observe complete typed traces and exact move-only
 payload allocations. They cover a pending pre-close operation followed by a
 new post-close operation, stale references, unpolled future closure, pending

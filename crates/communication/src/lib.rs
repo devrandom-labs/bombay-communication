@@ -238,9 +238,10 @@ pub struct Drained<C, U> {
 #[error("control lane closed: consumer dropped")]
 pub struct ControlClosed<T>(pub T);
 
-/// The user lane closed because the [`Consumer`] was dropped.
+/// The user lane or mailbox admission was closed.
+/// The consumer can remain alive and drain accepted work.
 #[derive(Debug, thiserror::Error)]
-#[error("user lane closed: consumer dropped")]
+#[error("user lane closed")]
 pub struct UserClosed<T>(pub T);
 
 /// A non-blocking user send could not be enqueued.
@@ -249,8 +250,9 @@ pub enum TrySendError<T> {
     /// The bounded user lane is at capacity.
     #[error("user lane full")]
     Full(T),
-    /// The consumer was dropped.
-    #[error("user lane closed: consumer dropped")]
+    /// The user lane or mailbox admission was closed.
+    /// The consumer can remain alive and drain accepted work.
+    #[error("user lane closed")]
     Closed(T),
 }
 
