@@ -766,10 +766,29 @@ impl<C> ControlSender<C> {
     /// # Errors
     /// Returns [`ControlClosed`] carrying `item` if the consumer is gone.
     pub fn send(&self, item: C) -> Result<(), ControlClosed<C>> {
+        self.send_map(item, core::convert::identity)
+    }
+
+    /// Map an owned input into a control signal after checking admission.
+    ///
+    /// Accepted signals follow the same queue-transfer contract as [`Self::send`].
+    /// Consumer closure during mapping does not turn that transfer into rejection.
+    /// Mapping runs synchronously before a queue slot is claimed; its panic cannot
+    /// leave an unpublished slot. The supplied mapping may itself block or panic.
+    /// Keep all values requiring rejection custody in `input`, rather than owned
+    /// captures of `map`.
+    ///
+    /// # Errors
+    /// Returns the complete original input without invoking `map` when the
+    /// consumer is already gone.
+    pub fn send_map<Input, Map>(&self, input: Input, map: Map) -> Result<(), ControlClosed<Input>>
+    where
+        Map: FnOnce(Input) -> C,
+    {
         if self.lane.core.consumer_gone.load(Ordering::Acquire) {
-            return Err(ControlClosed(item));
+            return Err(ControlClosed(input));
         }
-        self.lane.push(item);
+        self.lane.push(map(input));
         self.lane.core.wake_consumer();
         Ok(())
     }
