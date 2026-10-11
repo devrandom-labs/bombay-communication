@@ -108,6 +108,53 @@ debug and optimized builds: the retained sender incorrectly permits a new
 operation after owner closure. The correction preserves the pre-close
 operation and returns the exact post-close payload.
 
+## Control conversion and rejection custody
+
+`ControlSender::send_map(input, map)` checks the existing consumer-disappearance
+condition before converting the input into the concrete control protocol.
+Closed admission returns `ControlClosed(input)` without calling the conversion.
+After admission, conversion precedes queue-slot allocation and follows the exact
+existing `send` publication and wakeup sequence. Closure during conversion keeps
+the existing accepted-tail contract; acceptance transfers custody to the queue
+and does not promise consumption. A conversion panic claims no queue slot.
+
+This derived ownership law is required by Bombay's independent early-stop
+witness: forward-only event ingress consumes a move-only child report, so a
+failed later send cannot reconstruct that report. All rejection-bearing values
+belong in `input`; captures of the conversion are outside this recovery promise.
+The conversion runs synchronously and may itself block or panic. No inverse
+ingress, new actor protocol, closure phase, allocation or queue policy is added.
+Ordinary direct sends delegate to the same operation with identity conversion.
+
+The pre-edit law and bounded source scope were recorded in the owning
+Behavior developer-experience PRD before production changes. The focused
+regression precedes implementation; the corrected original-source inverse
+fails solely on five missing-method diagnostics. Four tests pass in both debug
+and release: exact original boxed input on closed admission, mixed direct/mapped
+FIFO, accepted-tail custody during consumer closure, and no unpublished slot
+after conversion panic. The initial test attempted a Loom-only blocking receive;
+correcting it to the public async receive changed tests only. It is not counted
+as an admission-law failure.
+
+Compared with owner 77bed281, production is +21/-2 (including documentation) in
+one existing module; the focused test is 103 lines in one new integration file.
+Public methods +1, public types/modules/dependencies/versions +0. Existing control
+liveness states, queue representation, rejection alternatives and atomic/wakeup
+operations are unchanged. No subordinate state or result is introduced. The
+surviving rejection owns the original input; the accepted queue owns the mapped
+control signal. No history, duplicate cause, nested transition authority or
+structural application syntax is added. Cross-checks use the existing control
+closure contract and Bombay's complete report-rejection law. Strict pinned
+Rust 1.95 workspace/all-target Clippy passes. All seven native Nix gates pass
+with 88 tests and zero skipped; all twelve existing Loom models pass with
+LOOM_MAX_PREEMPTIONS=3 in 210.51s. The real Bombay single-report-stop journey
+passes both profiles using this exact source: the later child retires with its
+original rejected report and ClosedParentControlLane, the earlier accepted
+report remains in the parent result, and both committed origins remain exact.
+Restoring only the original native report interpreter reproduces its control
+closure panic in both profiles. Disposition: pass for this bounded transport
+law. Owning Linux CI, downstream wrapper proof and release delivery remain open.
+
 ## Allocation and ordinary Rust comparison
 
 The mailbox adds one shared admission allocation at construction. After
