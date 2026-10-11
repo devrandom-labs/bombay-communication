@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/devrandom-labs/bombay-communication/compare/bombay-communication-v0.1.4...bombay-communication-v0.1.5) - 2026-10-11
+
+### Added
+
+- preserve control inputs before protocol conversion ([#11](https://github.com/devrandom-labs/bombay-communication/pull/11))
+
 ## [0.1.4](https://github.com/devrandom-labs/bombay-communication/compare/bombay-communication-v0.1.3...bombay-communication-v0.1.4) - 2026-10-10
 
 ### Fixed
