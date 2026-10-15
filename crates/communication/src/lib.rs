@@ -31,8 +31,10 @@
 //! The public API below is FIXED — the property suite in `communication-testkit`
 //! depends on these exact names and signatures.
 
+use std::cmp::Ordering as TicketOrder;
 use std::fmt;
 use std::mem::{MaybeUninit, replace};
+use std::task::Poll;
 
 #[cfg(not(loom))]
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
@@ -73,6 +75,8 @@ mod sync_notify {
         enabled: usize,
         /// Wake credits granted by `notify_one`/`notify_waiters`.
         woken: usize,
+        /// Native Notified captures this at creation, before enable/poll.
+        broadcast_generation: usize,
     }
 
     impl Notify {
@@ -82,6 +86,7 @@ mod sync_notify {
                     permit: false,
                     enabled: 0,
                     woken: 0,
+                    broadcast_generation: 0,
                 }),
                 cv: loom::sync::Condvar::new(),
             }
@@ -146,9 +151,22 @@ mod sync_notify {
 
         pub fn notify_waiters(&self) {
             let mut g = self.state.lock().unwrap();
+            g.broadcast_generation = g.broadcast_generation.wrapping_add(1);
             g.woken += g.enabled;
             g.enabled = 0;
             self.cv.notify_all();
+        }
+
+        pub(super) fn broadcast_generation(&self) -> usize {
+            self.state.lock().unwrap().broadcast_generation
+        }
+
+        /// Capacity observers do not consume the old producers' wake credits.
+        pub(super) fn wait_for_broadcast(&self, generation: usize) {
+            let mut g = self.state.lock().unwrap();
+            while g.broadcast_generation == generation {
+                g = self.cv.wait(g).unwrap();
+            }
         }
 
         /// Park until a wake credit or stored permit is available, then
@@ -256,6 +274,16 @@ pub enum TrySendError<T> {
     Closed(T),
 }
 
+/// An observation of mailbox capacity, without a delivery or reservation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Capacity {
+    /// A free insertion ticket was observed while mailbox admission was open.
+    /// Another producer or closure may win before the next delivery attempt.
+    Available,
+    /// Mailbox admission closed or its consumer is gone.
+    Closed,
+}
+
 /// State shared by both lanes and the consumer: the single wakeup point and
 /// the consumer-liveness flag.
 struct Core {
@@ -318,6 +346,8 @@ struct UserLane<U> {
     head: AtomicUsize,
     /// Parked-producer wakeup; gated by `waiting`.
     send_notify: Notify,
+    /// Broadcast capacity observations independently of parked senders.
+    capacity_notify: Notify,
     /// Number of producers parked on a full ring (guards `send_notify`).
     waiting: AtomicUsize,
     /// Live [`UserSender`] handles; lane is closed when this reaches 0.
@@ -388,30 +418,36 @@ impl<U> UserLane<U> {
         clippy::cast_possible_truncation,
         reason = "ticket arithmetic intentionally operates modulo 2^32; channel() bounds the live window"
     )]
-    fn pop(&self) -> Option<U> {
+    fn pop(&self, retained_user: &mut Option<U>) -> Option<U> {
         let head = self.head.load(Ordering::Relaxed);
-        // SAFETY: `head & mask` is always in bounds.
-        let slot = unsafe { self.ring.get_unchecked(head & self.mask()) };
-        let head32 = head as u32;
-        if slot.seq.load(Ordering::Acquire) != head32.wrapping_add(1) {
-            return None;
-        }
-        // SAFETY: the published `seq` (Acquire) orders the producer's write
-        // before this read; only the consumer pops, and the slot is not
-        // reused until re-ticketed below.
-        let v = unsafe { slot.val.get().read().assume_init() };
-        slot.seq.store(
-            head32.wrapping_add(self.ring.len() as u32),
-            Ordering::Release,
-        );
-        self.head.store(head.wrapping_add(1), Ordering::Relaxed);
+        let head = if retained_user.is_some() {
+            head.wrapping_sub(1)
+        } else {
+            // SAFETY: `head & mask` is always in bounds.
+            let slot = unsafe { self.ring.get_unchecked(head & self.mask()) };
+            let head32 = head as u32;
+            if slot.seq.load(Ordering::Acquire) != head32.wrapping_add(1) {
+                return None;
+            }
+            // SAFETY: the published `seq` (Acquire) orders the producer's write
+            // before this read; only the consumer pops, and the slot is not
+            // reused until re-ticketed below.
+            *retained_user = Some(unsafe { slot.val.get().read().assume_init() });
+            slot.seq.store(
+                head32.wrapping_add(self.ring.len() as u32),
+                Ordering::Release,
+            );
+            self.head.store(head.wrapping_add(1), Ordering::Relaxed);
+            head
+        };
         // Wake one parked producer, if any — checked every 4th pop only;
         // a parked producer is also released by the consumer's pre-park
         // check, so it can never sleep past an empty ring.
         if head.is_multiple_of(8) {
             self.release_one_waiter();
         }
-        Some(v)
+        self.capacity_notify.notify_waiters();
+        retained_user.take()
     }
 
     /// Release one parked producer, if any is waiting.
@@ -1054,6 +1090,9 @@ impl<U> Drop for MailboxOwner<U> {
         };
         // Final lane destruction can drop queued user payloads; release the
         // admission lock before dropping the durable sender and its lane.
+        if let MailboxAdmission::Open(sender) = &retired_admission {
+            sender.lane.capacity_notify.notify_waiters();
+        }
         drop(retired_admission);
     }
 }
@@ -1080,6 +1119,72 @@ impl<U> Clone for MailboxRef<U> {
 }
 
 impl<U> MailboxRef<U> {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "the observed insertion ticket uses the existing bounded u32 ring window"
+    )]
+    fn observe_capacity(&self, lane: &UserLane<U>) -> Poll<Capacity> {
+        loop {
+            let ticket_difference = {
+                #[cfg(not(loom))]
+                let Some(admission) = self.admission.upgrade() else {
+                    return Poll::Ready(Capacity::Closed);
+                };
+                #[cfg(loom)]
+                let admission = self.admission.clone();
+                let admission = admission.lock().expect("mailbox admission poisoned");
+                if matches!(&*admission, MailboxAdmission::Closed)
+                    || lane.core.consumer_gone.load(Ordering::Acquire)
+                {
+                    return Poll::Ready(Capacity::Closed);
+                }
+                let position = lane.tail.load(Ordering::Acquire);
+                let sequence = lane.ring[position & lane.mask()]
+                    .seq
+                    .load(Ordering::Acquire);
+                sequence.wrapping_sub(position as u32) as i32
+            };
+            match ticket_difference.cmp(&0) {
+                TicketOrder::Equal => return Poll::Ready(Capacity::Available),
+                TicketOrder::Greater => continue,
+                TicketOrder::Less => return Poll::Pending,
+            }
+        }
+    }
+
+    /// Wait until an insertion ticket is available or this mailbox closes.
+    ///
+    /// This operation takes no message, reserves no slot and holds no sender
+    /// permit. Cancelling its future leaves outside originals untouched and
+    /// does not keep admission open. An Available observation can be followed
+    /// by Full or Closed from a later delivery attempt. Recheck any applicable
+    /// authority before the existing nonwaiting attempt; readiness is no grant.
+    ///
+    /// Notification invokes registered wakers and can propagate their panics.
+    #[cfg(not(loom))]
+    pub async fn wait_for_capacity(&self) -> Capacity {
+        let lane = {
+            let Some(admission) = self.admission.upgrade() else {
+                return Capacity::Closed;
+            };
+            let admission = admission.lock().expect("mailbox admission poisoned");
+            match &*admission {
+                MailboxAdmission::Open(sender) => sender.lane.clone(),
+                MailboxAdmission::Closed => return Capacity::Closed,
+            }
+        };
+        loop {
+            let notified = lane.capacity_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.observe_capacity(&lane) {
+                Poll::Ready(capacity) => return capacity,
+                Poll::Pending => notified.await,
+            }
+        }
+    }
+
     fn acquire_sender(&self) -> Option<UserSender<U>> {
         #[cfg(not(loom))]
         let admission = self.admission.upgrade()?;
@@ -1255,6 +1360,8 @@ macro_rules! pop_control {
 pub struct Consumer<C, U> {
     ctl: Arc<ControlLane<C>>,
     usr: Arc<UserLane<U>>,
+    /// Original retained until its dequeue wake calls return successfully.
+    retained_user: Option<U>,
     core: Arc<Core>,
     aging_cap: usize,
     /// Consecutive control dequeues since the last user dequeue (the aging
@@ -1303,6 +1410,7 @@ impl<C, U> Consumer<C, U> {
     pub async fn recv(&mut self) -> Option<Received<C, U>> {
         // Split borrows: lanes + streak + latch + control cursor are disjoint fields.
         let usr = &self.usr;
+        let retained_user = &mut self.retained_user;
         let core = &self.core;
         let aging_cap = self.aging_cap;
         let streak = &mut self.consec_control;
@@ -1340,7 +1448,7 @@ impl<C, U> Consumer<C, U> {
         // early.
         macro_rules! pop_user_or_leg {
             () => {
-                match usr.pop() {
+                match usr.pop(retained_user) {
                     Some(u) => take_user!(u),
                     None if !*leg_reported && usr.closed() => {
                         // The `closed()` read (Acquire) synchronizes with
@@ -1351,7 +1459,7 @@ impl<C, U> Consumer<C, U> {
                         // an item AFTER it. A zero sender count is terminal
                         // (the anchor's conditional increment refuses it), so
                         // one re-pop exhausts the possibilities.
-                        match usr.pop() {
+                        match usr.pop(retained_user) {
                             Some(u) => take_user!(u),
                             None => take_leg!(),
                         }
@@ -1410,7 +1518,7 @@ impl<C, U> Consumer<C, U> {
                 core.parked.store(false, Ordering::Relaxed);
                 take_control!(c);
             }
-            match usr.pop() {
+            match usr.pop(retained_user) {
                 Some(u) => {
                     core.parked.store(false, Ordering::Relaxed);
                     take_user!(u);
@@ -1426,7 +1534,7 @@ impl<C, U> Consumer<C, U> {
                 // an item AFTER the end-marker.
                 None if !*leg_reported && usr.closed() => {
                     core.parked.store(false, Ordering::Relaxed);
-                    if let Some(u) = usr.pop() {
+                    if let Some(u) = usr.pop(retained_user) {
                         take_user!(u);
                     }
                     take_leg!();
@@ -1455,6 +1563,7 @@ impl<C, U> Consumer<C, U> {
     #[doc(hidden)]
     pub fn recv_blocking(&mut self) -> Option<Received<C, U>> {
         let usr = &self.usr;
+        let retained_user = &mut self.retained_user;
         let core = &self.core;
         let aging_cap = self.aging_cap;
         let streak = &mut self.consec_control;
@@ -1485,7 +1594,7 @@ impl<C, U> Consumer<C, U> {
         // yields its one-shot end-marker at every user-pop site.
         macro_rules! pop_user_or_leg {
             () => {
-                match usr.pop() {
+                match usr.pop(retained_user) {
                     Some(u) => take_user!(u),
                     None if !*leg_reported && usr.closed() => {
                         // The `closed()` read (Acquire) synchronizes with
@@ -1496,7 +1605,7 @@ impl<C, U> Consumer<C, U> {
                         // an item AFTER it. A zero sender count is terminal
                         // (the anchor's conditional increment refuses it), so
                         // one re-pop exhausts the possibilities.
-                        match usr.pop() {
+                        match usr.pop(retained_user) {
                             Some(u) => take_user!(u),
                             None => take_leg!(),
                         }
@@ -1548,7 +1657,7 @@ impl<C, U> Consumer<C, U> {
                 core.parked.store(false, Ordering::Relaxed);
                 take_control!(c);
             }
-            match usr.pop() {
+            match usr.pop(retained_user) {
                 Some(u) => {
                     core.parked.store(false, Ordering::Relaxed);
                     take_user!(u);
@@ -1560,7 +1669,7 @@ impl<C, U> Consumer<C, U> {
                 // `pop_user_or_leg!` (see the async `recv`).
                 None if !*leg_reported && usr.closed() => {
                     core.parked.store(false, Ordering::Relaxed);
-                    if let Some(u) = usr.pop() {
+                    if let Some(u) = usr.pop(retained_user) {
                         take_user!(u);
                     }
                     take_leg!();
@@ -1695,6 +1804,7 @@ impl<C, U> Consumer<C, U> {
             control.push(c);
         }
         let mut user = Vec::new();
+        user.extend(self.retained_user.take());
         let mut head = self.usr.head.load(Ordering::Relaxed);
         let tail = self.usr.tail.load(Ordering::Acquire);
         while head < tail {
@@ -1726,6 +1836,7 @@ impl<C, U> Consumer<C, U> {
             return;
         }
         self.usr.send_notify.notify_waiters();
+        self.usr.capacity_notify.notify_waiters();
         self.core.notify.notify_one();
     }
 }
@@ -1789,6 +1900,7 @@ pub fn channel<C, U>(cfg: Config) -> (ControlSender<C>, UserSender<U>, Consumer<
         tail: AtomicUsize::new(0),
         head: AtomicUsize::new(0),
         send_notify: Notify::new(),
+        capacity_notify: Notify::new(),
         waiting: AtomicUsize::new(0),
         senders: AtomicUsize::new(1),
         core: core.clone(),
@@ -1799,6 +1911,7 @@ pub fn channel<C, U>(cfg: Config) -> (ControlSender<C>, UserSender<U>, Consumer<
         Consumer {
             ctl,
             usr,
+            retained_user: None,
             core,
             aging_cap: cfg.aging_cap,
             consec_control: 0,
@@ -1837,7 +1950,151 @@ pub fn mailbox_channel<C, U>(
 
 #[cfg(test)]
 mod mailbox_admission_tests {
+    #[cfg(loom)]
+    use super::{Capacity, MailboxAdmission, MailboxRef, Received};
     use super::{Config, TrySendError, mailbox_channel};
+    #[cfg(loom)]
+    use loom::{model, thread};
+    #[cfg(loom)]
+    use std::task::Poll;
+
+    #[cfg(loom)]
+    fn wait_for_capacity_in_model<U>(mailbox: &MailboxRef<U>) -> Capacity {
+        let lane = {
+            let admission = mailbox.admission.lock().unwrap();
+            match &*admission {
+                MailboxAdmission::Open(sender) => sender.lane.clone(),
+                MailboxAdmission::Closed => return Capacity::Closed,
+            }
+        };
+        loop {
+            let generation = lane.capacity_notify.broadcast_generation();
+            match mailbox.observe_capacity(&lane) {
+                Poll::Ready(capacity) => return capacity,
+                Poll::Pending => lane.capacity_notify.wait_for_broadcast(generation),
+            }
+        }
+    }
+
+    #[cfg(loom)]
+    #[test]
+    fn capacity_model_dequeue_races_registration_without_an_extra_delivery() {
+        model(|| {
+            let (control, owner, mailbox, mut receiver) =
+                mailbox_channel::<(), u32>(Config::new(2));
+            mailbox.try_send(11).unwrap();
+            mailbox.try_send(13).unwrap();
+            let observed = thread::spawn(move || wait_for_capacity_in_model(&mailbox));
+            let first = receiver.recv_blocking();
+            let capacity = observed.join().unwrap();
+            owner.close_admission();
+            drop(control);
+            let second = receiver.recv_blocking();
+            let terminal = receiver.recv_blocking();
+            let exhausted = receiver.recv_blocking();
+            let trace = [first, second, terminal, exhausted];
+            let expected = [
+                Some(Received::User(11)),
+                Some(Received::User(13)),
+                Some(Received::UserLaneClosed),
+                None,
+            ];
+            assert_eq!(capacity, Capacity::Available);
+            assert_eq!(trace, expected);
+        });
+    }
+
+    #[cfg(loom)]
+    #[test]
+    fn capacity_model_owner_close_wakes_with_a_preclose_sender_alive() {
+        model(|| {
+            let (control, owner, mailbox, mut receiver) =
+                mailbox_channel::<(), u32>(Config::new(2));
+            mailbox.try_send(17).unwrap();
+            mailbox.try_send(19).unwrap();
+            let preclose = mailbox.acquire_sender().unwrap();
+            let observer = mailbox.clone();
+            let observed = thread::spawn(move || wait_for_capacity_in_model(&observer));
+            owner.close_admission();
+            let capacity = observed.join().unwrap();
+            let rejected = mailbox.try_send(23);
+            drop(preclose);
+            drop(control);
+            let first = receiver.recv_blocking();
+            let second = receiver.recv_blocking();
+            let terminal = receiver.recv_blocking();
+            let exhausted = receiver.recv_blocking();
+            let trace = [first, second, terminal, exhausted];
+            let expected = [
+                Some(Received::User(17)),
+                Some(Received::User(19)),
+                Some(Received::UserLaneClosed),
+                None,
+            ];
+            assert_eq!(capacity, Capacity::Closed);
+            assert!(matches!(&rejected, Err(TrySendError::Closed(23))));
+            assert_eq!(trace, expected);
+        });
+    }
+
+    #[cfg(loom)]
+    #[test]
+    fn capacity_model_consumer_teardown_wakes_and_preserves_the_drain() {
+        model(|| {
+            let (control, owner, mailbox, receiver) = mailbox_channel::<(), u32>(Config::new(2));
+            mailbox.try_send(29).unwrap();
+            mailbox.try_send(31).unwrap();
+            let observer = mailbox.clone();
+            let observed = thread::spawn(move || wait_for_capacity_in_model(&observer));
+            let drained = receiver.drain();
+            let capacity = observed.join().unwrap();
+            owner.close_admission();
+            drop(control);
+            assert_eq!(capacity, Capacity::Closed);
+            assert_eq!(drained.control, []);
+            assert_eq!(drained.user, [29, 31]);
+        });
+    }
+
+    #[cfg(loom)]
+    #[test]
+    fn capacity_model_broadcast_before_registration_survives_competing_refill() {
+        model(|| {
+            let (control, owner, mailbox, mut receiver) =
+                mailbox_channel::<(), u32>(Config::new(2));
+            mailbox.try_send(37).unwrap();
+            mailbox.try_send(41).unwrap();
+            let lane = {
+                let admission = mailbox.admission.lock().unwrap();
+                match &*admission {
+                    MailboxAdmission::Open(sender) => sender.lane.clone(),
+                    MailboxAdmission::Closed => panic!("the owner remains open"),
+                }
+            };
+            let generation = lane.capacity_notify.broadcast_generation();
+            let first = receiver.recv_blocking();
+            let competitor = mailbox.try_send(43);
+            let capacity = mailbox.observe_capacity(&lane);
+            lane.capacity_notify.wait_for_broadcast(generation);
+            owner.close_admission();
+            drop(control);
+            let second = receiver.recv_blocking();
+            let third = receiver.recv_blocking();
+            let terminal = receiver.recv_blocking();
+            let exhausted = receiver.recv_blocking();
+            let trace = [first, second, third, terminal, exhausted];
+            let expected = [
+                Some(Received::User(37)),
+                Some(Received::User(41)),
+                Some(Received::User(43)),
+                Some(Received::UserLaneClosed),
+                None,
+            ];
+            assert!(matches!(&competitor, Ok(())));
+            assert_eq!(capacity, Poll::Pending);
+            assert_eq!(trace, expected);
+        });
+    }
 
     #[test]
     fn promoted_reference_cannot_extend_owner_admission() {

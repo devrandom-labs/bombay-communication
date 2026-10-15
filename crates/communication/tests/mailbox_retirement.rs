@@ -1,16 +1,258 @@
-use communication::{Config, MailboxRef, Received, TrySendError, UserClosed, mailbox_channel};
+use communication::{
+    Capacity, Config, MailboxRef, Received, TrySendError, UserClosed, mailbox_channel,
+};
 use std::cell::Cell;
 use std::future::Future;
 use std::pin::pin;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use tokio::sync::Barrier;
 
 #[derive(Debug, PartialEq, Eq)]
 struct MoveOnly(u32);
+
+#[derive(Default)]
+struct CapacityWakes(AtomicUsize);
+
+impl Wake for CapacityWakes {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn capacity_observation_wakes_on_a_non_stride_pop_without_taking_the_original() {
+    let (control, owner, mailbox, mut receiver) =
+        mailbox_channel::<(), Box<MoveOnly>>(Config::new(2));
+    let wakes = Arc::new(CapacityWakes::default());
+    let waker = Waker::from(wakes.clone());
+    let mut context = Context::from_waker(&waker);
+    let mut empty = Box::pin(mailbox.wait_for_capacity());
+    let initially_available = empty.as_mut().poll(&mut context);
+    drop(empty);
+    mailbox.try_send(Box::new(MoveOnly(0))).unwrap();
+    mailbox.try_send(Box::new(MoveOnly(1))).unwrap();
+    let prefix = {
+        let mut receiving = pin!(receiver.recv());
+        receiving.as_mut().poll(&mut context)
+    };
+    mailbox.try_send(Box::new(MoveOnly(2))).unwrap();
+    let original = Box::new(MoveOnly(3));
+    let allocation = ptr::from_ref(original.as_ref());
+    let refusal = mailbox.try_send(original);
+    let Err(TrySendError::Full(original)) = refusal else {
+        panic!("the independent prefix must occupy both slots");
+    };
+    let mut capacity = Box::pin(mailbox.wait_for_capacity());
+    let parked = capacity.as_mut().poll(&mut context);
+    let still_parked = capacity.as_mut().poll(&mut context);
+    let idle_wakes = wakes.0.load(Ordering::Relaxed);
+    let released = {
+        let mut receiving = pin!(receiver.recv());
+        receiving.as_mut().poll(&mut context)
+    };
+    let dequeue_wakes = wakes.0.load(Ordering::Relaxed);
+    let available = capacity.as_mut().poll(&mut context);
+    drop(capacity);
+    let retained_allocation = ptr::from_ref(original.as_ref());
+    let admitted = mailbox.try_send(original);
+    owner.close_admission();
+    drop(control);
+    let mut tail = Vec::new();
+    for _ in 0..4 {
+        let mut receiving = pin!(receiver.recv());
+        tail.push(receiving.as_mut().poll(&mut context));
+    }
+    let expected = [
+        Poll::Ready(Some(Received::User(Box::new(MoveOnly(2))))),
+        Poll::Ready(Some(Received::User(Box::new(MoveOnly(3))))),
+        Poll::Ready(Some(Received::UserLaneClosed)),
+        Poll::Ready(None),
+    ];
+    let delivered_allocation = match &tail[1] {
+        Poll::Ready(Some(Received::User(delivered))) => Some(ptr::from_ref(delivered.as_ref())),
+        _ => None,
+    };
+    let expected_prefix = Poll::Ready(Some(Received::User(Box::new(MoveOnly(0)))));
+    let expected_released = Poll::Ready(Some(Received::User(Box::new(MoveOnly(1)))));
+    assert_eq!(prefix, expected_prefix);
+    assert_eq!(released, expected_released);
+    assert!(matches!(
+        &initially_available,
+        Poll::Ready(Capacity::Available)
+    ));
+    assert!(matches!(&parked, Poll::Pending));
+    assert!(matches!(&still_parked, Poll::Pending));
+    assert_eq!(idle_wakes, 0);
+    assert!(dequeue_wakes > idle_wakes);
+    assert!(matches!(&available, Poll::Ready(Capacity::Available)));
+    assert_eq!(retained_allocation, allocation);
+    assert_eq!(delivered_allocation, Some(allocation));
+    assert!(matches!(&admitted, Ok(())));
+    assert_eq!(tail, expected);
+}
+
+#[test]
+fn capacity_observation_closes_while_a_preclose_sender_still_owns_its_permit() {
+    let (control, owner, mailbox, mut receiver) = mailbox_channel::<(), MoveOnly>(Config::new(2));
+    mailbox.try_send(MoveOnly(11)).unwrap();
+    mailbox.try_send(MoveOnly(13)).unwrap();
+    let mut preclose = Box::pin(mailbox.send(MoveOnly(17)));
+    let mut sender_context = Context::from_waker(Waker::noop());
+    let sender_parked = preclose.as_mut().poll(&mut sender_context);
+    let wakes = Arc::new(CapacityWakes::default());
+    let waker = Waker::from(wakes.clone());
+    let mut context = Context::from_waker(&waker);
+    let mut capacity = Box::pin(mailbox.wait_for_capacity());
+    let parked = capacity.as_mut().poll(&mut context);
+    owner.close_admission();
+    let closure_wakes = wakes.0.load(Ordering::Relaxed);
+    let first = {
+        let mut receiving = pin!(receiver.recv());
+        receiving.as_mut().poll(&mut sender_context)
+    };
+    let preclose_completion = preclose.as_mut().poll(&mut sender_context);
+    drop(preclose);
+    let mut replay = Box::pin(mailbox.wait_for_capacity());
+    let replayed = replay.as_mut().poll(&mut context);
+    drop(replay);
+    drop(control);
+    let mut trace = vec![first];
+    for _ in 0..4 {
+        let mut receiving = pin!(receiver.recv());
+        trace.push(receiving.as_mut().poll(&mut sender_context));
+    }
+    let closed = capacity.as_mut().poll(&mut context);
+    drop(capacity);
+    let mut cleanup = Vec::new();
+    for _ in 0..2 {
+        let mut receiving = pin!(receiver.recv());
+        cleanup.push(receiving.as_mut().poll(&mut sender_context));
+    }
+    let expected = [
+        Poll::Ready(Some(Received::User(MoveOnly(11)))),
+        Poll::Ready(Some(Received::User(MoveOnly(13)))),
+        Poll::Ready(Some(Received::User(MoveOnly(17)))),
+        Poll::Ready(Some(Received::UserLaneClosed)),
+        Poll::Ready(None),
+    ];
+    assert!(matches!(&sender_parked, Poll::Pending));
+    assert!(matches!(&parked, Poll::Pending));
+    assert!(closure_wakes > 0);
+    assert!(matches!(&closed, Poll::Ready(Capacity::Closed)));
+    assert!(matches!(&replayed, Poll::Ready(Capacity::Closed)));
+    assert!(matches!(&preclose_completion, Poll::Ready(Ok(()))));
+    assert_eq!(trace, expected);
+    assert_eq!(cleanup, [Poll::Ready(None), Poll::Ready(None)]);
+}
+
+#[test]
+fn capacity_observation_returns_closed_on_consumer_teardown_without_losing_queued_work() {
+    let (control, owner, mailbox, receiver) = mailbox_channel::<(), MoveOnly>(Config::new(2));
+    mailbox.try_send(MoveOnly(19)).unwrap();
+    mailbox.try_send(MoveOnly(23)).unwrap();
+    let wakes = Arc::new(CapacityWakes::default());
+    let waker = Waker::from(wakes.clone());
+    let mut context = Context::from_waker(&waker);
+    let mut capacity = Box::pin(mailbox.wait_for_capacity());
+    let parked = capacity.as_mut().poll(&mut context);
+    let drained = receiver.drain();
+    let teardown_wakes = wakes.0.load(Ordering::Relaxed);
+    let closed = capacity.as_mut().poll(&mut context);
+    drop(capacity);
+    let rejected = mailbox.try_send(MoveOnly(29));
+    owner.close_admission();
+    drop(control);
+    assert!(matches!(&parked, Poll::Pending));
+    assert!(teardown_wakes > 0);
+    assert!(matches!(&closed, Poll::Ready(Capacity::Closed)));
+    assert_eq!(drained.control, []);
+    assert_eq!(drained.user, [MoveOnly(19), MoveOnly(23)]);
+    assert!(matches!(&rejected, Err(TrySendError::Closed(MoveOnly(29)))));
+}
+
+#[test]
+fn capacity_observer_withdrawal_and_competition_preserve_native_sender_progress() {
+    let (control, owner, mailbox, mut receiver) = mailbox_channel::<(), MoveOnly>(Config::new(2));
+    mailbox.try_send(MoveOnly(31)).unwrap();
+    mailbox.try_send(MoveOnly(37)).unwrap();
+    let first_wakes = Arc::new(CapacityWakes::default());
+    let second_wakes = Arc::new(CapacityWakes::default());
+    let sender_wakes = Arc::new(CapacityWakes::default());
+    let first_waker = Waker::from(first_wakes.clone());
+    let second_waker = Waker::from(second_wakes.clone());
+    let sender_waker = Waker::from(sender_wakes.clone());
+    let mut first_context = Context::from_waker(&first_waker);
+    let mut second_context = Context::from_waker(&second_waker);
+    let mut sender_context = Context::from_waker(&sender_waker);
+    let mut first = Box::pin(mailbox.wait_for_capacity());
+    let mut second = Box::pin(mailbox.wait_for_capacity());
+    let first_parked = first.as_mut().poll(&mut first_context);
+    let second_parked = second.as_mut().poll(&mut second_context);
+    let mut sender = Box::pin(mailbox.send(MoveOnly(41)));
+    let sender_parked = sender.as_mut().poll(&mut sender_context);
+    let prefix = {
+        let mut receiving = pin!(receiver.recv());
+        receiving.as_mut().poll(&mut sender_context)
+    };
+    let first_notifications = first_wakes.0.load(Ordering::Relaxed);
+    let second_notifications = second_wakes.0.load(Ordering::Relaxed);
+    let sender_notifications = sender_wakes.0.load(Ordering::Relaxed);
+    drop(first);
+    let available = second.as_mut().poll(&mut second_context);
+    drop(second);
+    let competitor = mailbox.try_send(MoveOnly(43));
+    let outside = Box::new(MoveOnly(47));
+    let allocation = ptr::from_ref(outside.as_ref());
+    let mut cancelled = Box::pin(mailbox.wait_for_capacity());
+    let competition = cancelled.as_mut().poll(&mut second_context);
+    let cancellation_wakes = second_wakes.0.load(Ordering::Relaxed);
+    drop(cancelled);
+    let released = {
+        let mut receiving = pin!(receiver.recv());
+        receiving.as_mut().poll(&mut sender_context)
+    };
+    let sender_completion = sender.as_mut().poll(&mut sender_context);
+    drop(sender);
+    owner.close_admission();
+    drop(control);
+    let mut trace = vec![prefix, released];
+    for _ in 0..4 {
+        let mut receiving = pin!(receiver.recv());
+        trace.push(receiving.as_mut().poll(&mut sender_context));
+    }
+    let after_cancellation_wakes = second_wakes.0.load(Ordering::Relaxed);
+    let retained_allocation = ptr::from_ref(outside.as_ref());
+    let expected = [
+        Poll::Ready(Some(Received::User(MoveOnly(31)))),
+        Poll::Ready(Some(Received::User(MoveOnly(37)))),
+        Poll::Ready(Some(Received::User(MoveOnly(43)))),
+        Poll::Ready(Some(Received::User(MoveOnly(41)))),
+        Poll::Ready(Some(Received::UserLaneClosed)),
+        Poll::Ready(None),
+    ];
+    assert!(matches!(&first_parked, Poll::Pending));
+    assert!(matches!(&second_parked, Poll::Pending));
+    assert!(matches!(&sender_parked, Poll::Pending));
+    assert!(first_notifications > 0);
+    assert!(second_notifications > 0);
+    assert!(sender_notifications > 0);
+    assert!(matches!(&available, Poll::Ready(Capacity::Available)));
+    assert!(matches!(&competitor, Ok(())));
+    assert!(matches!(&competition, Poll::Pending));
+    assert_eq!(after_cancellation_wakes, cancellation_wakes);
+    assert_eq!(retained_allocation, allocation);
+    assert_eq!(*outside, MoveOnly(47));
+    assert!(matches!(&sender_completion, Poll::Ready(Ok(()))));
+    assert_eq!(trace, expected);
+}
 
 #[tokio::test]
 async fn close_rejects_stale_refs_with_the_exact_payload_and_drains_accepted_work() {
@@ -365,4 +607,219 @@ async fn admission_accepts_send_payloads_without_a_sync_bound() {
     drop(control);
     let exhausted = receiver.recv().await;
     assert_eq!(exhausted, None);
+}
+
+mod capacity_notification {
+    use super::{CapacityWakes, Config, Received, mailbox_channel};
+    use std::future::Future;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::pin::pin;
+    use std::ptr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Wake, Waker};
+
+    #[derive(Debug)]
+    struct Delivery {
+        id: u32,
+        dropped: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl Drop for Delivery {
+        fn drop(&mut self) {
+            self.dropped.lock().unwrap().push(self.id);
+        }
+    }
+
+    struct Notification(Arc<AtomicUsize>);
+
+    impl Wake for Notification {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            panic!("capacity notification failed");
+        }
+    }
+
+    #[test]
+    fn a_capacity_waker_panic_does_not_erase_the_dequeued_original() {
+        let dropped = Arc::new(Mutex::new(Vec::with_capacity(2)));
+        let [first, second] = [59, 61].map(|id| {
+            Box::new(Delivery {
+                id,
+                dropped: dropped.clone(),
+            })
+        });
+        let first_allocation = ptr::from_ref(first.as_ref());
+        let second_allocation = ptr::from_ref(second.as_ref());
+        let (control, owner, mailbox, mut receiver) =
+            mailbox_channel::<(), Box<Delivery>>(Config::new(2));
+        mailbox.try_send(first).unwrap();
+        mailbox.try_send(second).unwrap();
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(Notification(notifications.clone())));
+        let mut context = Context::from_waker(&waker);
+        let mut capacity = Box::pin(mailbox.wait_for_capacity());
+        let parked = capacity.as_mut().poll(&mut context);
+        let mut receiving_context = Context::from_waker(Waker::noop());
+        let acquired = catch_unwind(AssertUnwindSafe(|| {
+            let mut receiving = pin!(receiver.recv());
+            receiving.as_mut().poll(&mut receiving_context)
+        }));
+        drop(capacity);
+        let dropped_before_ready = dropped.lock().unwrap().clone();
+        let drained = receiver.drain();
+        owner.close_admission();
+        drop(control);
+        let dropped_after_cleanup = dropped.lock().unwrap().clone();
+        let remaining: Vec<_> = drained
+            .user
+            .iter()
+            .map(|original| (original.id, ptr::from_ref(original.as_ref())))
+            .collect();
+        assert!(parked.is_pending());
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        assert!(acquired.is_err());
+        assert!(drained.control.is_empty());
+        assert_eq!(remaining, [(59, first_allocation), (61, second_allocation)]);
+        assert_eq!(dropped_after_cleanup, dropped_before_ready);
+        assert!(dropped_before_ready.is_empty());
+    }
+
+    #[test]
+    fn a_cancelled_receive_after_wake_unwind_preserves_fifo_and_terminal_order() {
+        let dropped = Arc::new(Mutex::new(Vec::with_capacity(2)));
+        let [first, second] = [71, 73].map(|id| {
+            Box::new(Delivery {
+                id,
+                dropped: dropped.clone(),
+            })
+        });
+        let allocations = [
+            ptr::from_ref(first.as_ref()),
+            ptr::from_ref(second.as_ref()),
+        ];
+        let (control, owner, mailbox, mut receiver) =
+            mailbox_channel::<u32, Box<Delivery>>(Config::new(2));
+        mailbox.try_send(first).unwrap();
+        mailbox.try_send(second).unwrap();
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(Notification(notifications.clone())));
+        let mut context = Context::from_waker(&waker);
+        let mut capacity = Box::pin(mailbox.wait_for_capacity());
+        let parked = capacity.as_mut().poll(&mut context);
+        let mut receiving_context = Context::from_waker(Waker::noop());
+        let mut receiving = Box::pin(receiver.recv());
+        let acquired = catch_unwind(AssertUnwindSafe(|| {
+            receiving.as_mut().poll(&mut receiving_context)
+        }));
+        drop(receiving);
+        drop(capacity);
+        let dropped_before_retry = dropped.lock().unwrap().clone();
+        let third = Box::new(Delivery {
+            id: 75,
+            dropped: dropped.clone(),
+        });
+        let third_allocation = ptr::from_ref(third.as_ref());
+        let refilled = mailbox.try_send(third);
+        let retry_notifications = Arc::new(CapacityWakes::default());
+        let retry_waker = Waker::from(retry_notifications.clone());
+        let mut retry_context = Context::from_waker(&retry_waker);
+        let mut retry_capacity = Box::pin(mailbox.wait_for_capacity());
+        let retry_parked = retry_capacity.as_mut().poll(&mut retry_context);
+        let idle_retry_wakes = retry_notifications.0.load(Ordering::Relaxed);
+        let control_admitted = control.send(79);
+        let only_control = {
+            let mut receiving = pin!(receiver.recv_control());
+            receiving.as_mut().poll(&mut receiving_context)
+        };
+        let mut trace = Vec::new();
+        {
+            let mut receiving = pin!(receiver.recv());
+            trace.push(receiving.as_mut().poll(&mut receiving_context));
+        }
+        let retried_wakes = retry_notifications.0.load(Ordering::Relaxed);
+        let still_full = retry_capacity.as_mut().poll(&mut retry_context);
+        drop(retry_capacity);
+        owner.close_admission();
+        drop(control);
+        for _ in 0..4 {
+            let mut receiving = pin!(receiver.recv());
+            trace.push(receiving.as_mut().poll(&mut receiving_context));
+        }
+        let drained = receiver.drain();
+        let dropped_after_cleanup = dropped.lock().unwrap().clone();
+        let delivered: Vec<_> = trace
+            .iter()
+            .filter_map(|received| match received {
+                Poll::Ready(Some(Received::User(original))) => {
+                    Some((original.id, ptr::from_ref(original.as_ref())))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(parked.is_pending());
+        assert!(acquired.is_err());
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        assert!(dropped_before_retry.is_empty());
+        assert!(matches!(refilled, Ok(())));
+        assert!(matches!(retry_parked, Poll::Pending));
+        assert_eq!(idle_retry_wakes, 0);
+        assert!(retried_wakes > idle_retry_wakes);
+        assert!(matches!(still_full, Poll::Pending));
+        assert!(matches!(control_admitted, Ok(())));
+        assert!(matches!(only_control, Poll::Ready(Some(79))));
+        assert_eq!(
+            delivered,
+            [
+                (71, allocations[0]),
+                (73, allocations[1]),
+                (75, third_allocation)
+            ]
+        );
+        assert!(matches!(
+            &trace[3],
+            Poll::Ready(Some(Received::UserLaneClosed))
+        ));
+        assert!(matches!(&trace[4], Poll::Ready(None)));
+        assert!(drained.control.is_empty());
+        assert!(drained.user.is_empty());
+        assert!(dropped_after_cleanup.is_empty());
+    }
+
+    #[test]
+    fn surrendering_the_consumer_after_wake_unwind_drops_each_original_once() {
+        let dropped = Arc::new(Mutex::new(Vec::with_capacity(2)));
+        let (control, owner, mailbox, mut receiver) =
+            mailbox_channel::<(), Box<Delivery>>(Config::new(2));
+        for id in [83, 89] {
+            let admitted = mailbox.try_send(Box::new(Delivery {
+                id,
+                dropped: dropped.clone(),
+            }));
+            admitted.unwrap();
+        }
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(Notification(notifications.clone())));
+        let mut context = Context::from_waker(&waker);
+        let mut capacity = Box::pin(mailbox.wait_for_capacity());
+        let parked = capacity.as_mut().poll(&mut context);
+        let mut receiving_context = Context::from_waker(Waker::noop());
+        let acquired = catch_unwind(AssertUnwindSafe(|| {
+            let mut receiving = pin!(receiver.recv());
+            receiving.as_mut().poll(&mut receiving_context)
+        }));
+        drop(capacity);
+        let dropped_before_surrender = dropped.lock().unwrap().clone();
+        drop(receiver);
+        owner.close_admission();
+        drop(control);
+        drop(mailbox);
+        let mut dropped_after_surrender = dropped.lock().unwrap().clone();
+        dropped_after_surrender.sort_unstable();
+        assert!(parked.is_pending());
+        assert!(acquired.is_err());
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        assert!(dropped_before_surrender.is_empty());
+        assert_eq!(dropped_after_surrender, [83, 89]);
+    }
 }
