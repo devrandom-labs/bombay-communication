@@ -3,13 +3,36 @@ use communication::{
 };
 use std::cell::Cell;
 use std::future::Future;
-use std::pin::pin;
+use std::marker::PhantomPinned;
+use std::pin::{Pin, pin};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use tokio::sync::Barrier;
+
+#[tokio::test]
+async fn pinned_payloads_preserve_consumer_mobility_and_complete_delivery() {
+    let (control, owner, mailbox, receiver) =
+        mailbox_channel::<PhantomPinned, PhantomPinned>(Config::new(2));
+    let mut receiver = pin!(receiver);
+    let receiver = Pin::get_mut(receiver.as_mut());
+    let control_delivery = control.send(PhantomPinned);
+    let user_delivery = mailbox.try_send(PhantomPinned);
+    owner.close_admission();
+    drop((control, mailbox));
+    let control_message = receiver.recv().await;
+    let user_message = receiver.recv().await;
+    let terminal = receiver.recv().await;
+    let exhausted = receiver.recv().await;
+    assert!(control_delivery.is_ok());
+    assert!(user_delivery.is_ok());
+    assert!(matches!(control_message, Some(Received::Control(_))));
+    assert!(matches!(user_message, Some(Received::User(_))));
+    assert!(matches!(terminal, Some(Received::UserLaneClosed)));
+    assert!(exhausted.is_none());
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct MoveOnly(u32);

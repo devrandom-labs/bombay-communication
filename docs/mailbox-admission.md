@@ -4,10 +4,13 @@
 
 The source candidate observes readiness without reserving capacity or a sender.
 A dequeued user original remains owned through notification panic, retry and drain.
-Native controls pass 20/20 in debug and optimized builds, including actual Tokio
+Native controls pass 21/21 in debug and optimized builds, including actual Tokio
 capacity tasks; four bounded Loom models also pass in both profiles. Intentional
 cuts fail their targeted custody/wake laws. Pinned Nix passes all seven Darwin
-checks (100 workspace tests); strict Clippy passes.
+checks (101 workspace tests); strict Clippy passes.
+Consumer remains `Unpin` even with `!Unpin` payloads; it does not pin them.
+Package tests run in separate Nextest processes, followed by Cargo doctests.
+The earlier single-allocation libtest failure is retained; its cause is unproven.
 The isolated observer/delivery allocation window records zero successful allocations.
 On pinned aarch64 Rust 1.95, Consumer sizes are 72 bytes for Box<u64> and
 80 bytes for u64, versus 64 bytes each at 24ad2b9; all have alignment 8.

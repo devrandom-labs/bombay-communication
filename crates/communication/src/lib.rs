@@ -1382,6 +1382,10 @@ pub struct Consumer<C, U> {
     usr_closed_reported: bool,
 }
 
+// Consumer has no structural pin projections or self-references.
+// Queued and retained payloads are never pinned through this owner.
+impl<C, U> Unpin for Consumer<C, U> {}
+
 // SAFETY: `ctl_block` is dereferenced only by the consumer that owns it, and
 // the pointee outlives the consumer (freed in `ControlLane::drop`, and the
 // consumer holds an `Arc<ControlLane<C>>`).
