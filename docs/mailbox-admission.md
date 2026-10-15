@@ -4,16 +4,35 @@
 
 The source candidate observes readiness without reserving capacity or a sender.
 A dequeued user original remains owned through notification panic, retry and drain.
-Native controls pass 15/15 in debug and optimized builds; four bounded Loom models
-also pass in both profiles. Intentional cuts fail their targeted custody/wake laws.
-Pinned Nix passes all seven Darwin checks (95 workspace tests); strict Clippy passes.
+Native controls pass 20/20 in debug and optimized builds, including actual Tokio
+capacity tasks; four bounded Loom models also pass in both profiles. Intentional
+cuts fail their targeted custody/wake laws. Pinned Nix passes all seven Darwin
+checks (100 workspace tests); strict Clippy passes.
 The isolated observer/delivery allocation window records zero successful allocations.
 On pinned aarch64 Rust 1.95, Consumer sizes are 72 bytes for Box<u64> and
 80 bytes for u64, versus 64 bytes each at 24ad2b9; all have alignment 8.
-Timing and close/teardown notification-panic proofs are unresolved merge gates.
-Linux PR CI, review, merge, publication and Bombay adoption remain open.
+Two paired same-host runs with unchanged Criterion settings measured:
+
+- Drain: 66.5–66.8 µs at 24ad2b9 versus 123.8–124.7 µs here (86–87% slower).
+- 1,024 owner-reference rounds: 13.0–13.1 µs versus 18.8–19.0 µs (45% slower).
+- 1,024 raw-anchor rounds: 8.9–9.0 µs versus 14.5 µs (61–63% slower).
+- Observer round: 43.5 ns without registration versus 131.1–131.7 ns registered.
+
+These costs are accepted for this correctness milestone. They measure whole
+workloads, not an isolated cause, cross-thread latency or an Application service;
+normal OS activity and sequential run order remain measurement limitations.
+No performance SLO is claimed. Tokio-hosted tasks prove wake progress on dequeue,
+admission closure and consumer disposal under nonpanicking executor wakers.
+Arbitrary foreign-waker panic may prevent sibling scheduling; that progress is
+unsupported, while closure and exact original-payload custody remain required.
+The broader ba015 sibling-progress expectation failed in both profiles; its red
+evidence is preserved, not reclassified as a passing proof.
+Latest-source Linux PR CI, review, merge, publication and Bombay adoption remain open.
 
 ## Historical preparation
+
+The current supported contract explicitly reconciles the earlier broader panic
+gate above. It adds no notification mechanism or panic-discharge policy.
 
 Before native dequeue-custody repair, preserve healthy0449 and the actual
 10f7407c panic regression. The selected existing Consumer owns one Option<U>

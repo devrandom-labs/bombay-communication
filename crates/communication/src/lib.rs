@@ -1161,7 +1161,10 @@ impl<U> MailboxRef<U> {
     /// by Full or Closed from a later delivery attempt. Recheck any applicable
     /// authority before the existing nonwaiting attempt; readiness is no grant.
     ///
-    /// Notification invokes registered wakers and can propagate their panics.
+    /// With nonpanicking executor wakers, changes wake registered observers.
+    /// Notification can propagate a custom waker's panic; sibling scheduling
+    /// after that panic is not guaranteed. Closure still takes effect and
+    /// original queued messages remain recoverable or owned until surrender.
     #[cfg(not(loom))]
     pub async fn wait_for_capacity(&self) -> Capacity {
         let lane = {
