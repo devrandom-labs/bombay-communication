@@ -2,9 +2,12 @@
 //! recv latency while the user lane is saturated — it must stay flat as the
 //! backlog grows. A second bench measures drain throughput.
 
-use communication::{Config, Received, channel, mailbox_channel};
+use communication::{Capacity, Config, Received, channel, mailbox_channel};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use std::future::{Future, poll_fn};
 use std::hint::black_box;
+use std::pin::pin;
+use std::task::Poll;
 use tokio::runtime::Runtime;
 
 const DRAIN_ITEMS_PER_LANE: u32 = 10_000;
@@ -289,6 +292,51 @@ fn mailbox_admission(c: &mut Criterion) {
     group.finish();
 }
 
+#[derive(Clone, Copy, Debug)]
+enum CapacityObservation {
+    Absent,
+    Registered,
+}
+
+fn mailbox_capacity(c: &mut Criterion) {
+    let runtime = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("mailbox_capacity");
+    for observation in [CapacityObservation::Absent, CapacityObservation::Registered] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{observation:?}")),
+            &observation,
+            |b, &observation| {
+                b.to_async(&runtime).iter_batched(
+                    || {
+                        let mailbox = mailbox_channel::<(), u64>(Config::new(2));
+                        mailbox.2.try_send(7).unwrap();
+                        mailbox.2.try_send(9).unwrap();
+                        mailbox
+                    },
+                    |(control, owner, mailbox, mut receiver)| async move {
+                        let mut capacity = pin!(mailbox.wait_for_capacity());
+                        if let CapacityObservation::Registered = observation {
+                            let initial =
+                                poll_fn(|cx| Poll::Ready(capacity.as_mut().poll(cx))).await;
+                            assert_eq!(initial, Poll::Pending);
+                        }
+                        let delivered = receiver.recv().await;
+                        assert_eq!(delivered, Some(Received::User(7)));
+                        if let CapacityObservation::Registered = observation {
+                            let available = capacity.await;
+                            assert_eq!(available, Capacity::Available);
+                        }
+                        mailbox.try_send(11).unwrap();
+                        black_box((control, owner, receiver))
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
 fn mailbox_control_latency_under_backlog(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("mailbox_control_latency_under_backlog");
@@ -369,6 +417,7 @@ criterion_group!(
     drain_throughput,
     producer_contention,
     mailbox_admission,
+    mailbox_capacity,
     mailbox_control_latency_under_backlog,
     mailbox_producer_contention
 );

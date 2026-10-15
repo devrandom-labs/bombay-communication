@@ -1,5 +1,156 @@
 # Mailbox admission
 
+## Capacity observation — current verification
+
+The source candidate observes readiness without reserving capacity or a sender.
+A dequeued user original remains owned through notification panic, retry and drain.
+Native controls pass 21/21 in debug and optimized builds, including actual Tokio
+capacity tasks; four bounded Loom models also pass in both profiles. Intentional
+cuts fail their targeted custody/wake laws. Pinned Nix passes all seven Darwin
+checks (101 workspace tests); strict Clippy passes.
+Consumer remains `Unpin` even with `!Unpin` payloads; it does not pin them.
+Package tests run in separate Nextest processes, followed by Cargo doctests.
+The earlier single-allocation libtest failure is retained; its cause is unproven.
+The isolated observer/delivery allocation window records zero successful allocations.
+On pinned aarch64 Rust 1.95, Consumer sizes are 72 bytes for Box<u64> and
+80 bytes for u64, versus 64 bytes each at 24ad2b9; all have alignment 8.
+Two paired same-host runs with unchanged Criterion settings measured:
+
+- Drain: 66.5–66.8 µs at 24ad2b9 versus 123.8–124.7 µs here (86–87% slower).
+- 1,024 owner-reference rounds: 13.0–13.1 µs versus 18.8–19.0 µs (45% slower).
+- 1,024 raw-anchor rounds: 8.9–9.0 µs versus 14.5 µs (61–63% slower).
+- Observer round: 43.5 ns without registration versus 131.1–131.7 ns registered.
+
+These costs are accepted for this correctness milestone. They measure whole
+workloads, not an isolated cause, cross-thread latency or an Application service;
+normal OS activity and sequential run order remain measurement limitations.
+No performance SLO is claimed. Tokio-hosted tasks prove wake progress on dequeue,
+admission closure and consumer disposal under nonpanicking executor wakers.
+Arbitrary foreign-waker panic may prevent sibling scheduling; that progress is
+unsupported, while closure and exact original-payload custody remain required.
+The broader ba015 sibling-progress expectation failed in both profiles; its red
+evidence is preserved, not reclassified as a passing proof.
+Latest-source Linux PR CI, review, merge, publication and Bombay adoption remain open.
+
+## Historical preparation
+
+The current supported contract explicitly reconciles the earlier broader panic
+gate above. It adds no notification mechanism or panic-discharge policy.
+
+Before native dequeue-custody repair, preserve healthy0449 and the actual
+10f7407c panic regression. The selected existing Consumer owns one Option<U>
+from queue removal through successful wake return and caller transfer. Retry
+wake hints from the previous head ticket before transferring a retained original;
+no new dequeue occurs. Drain prepends it, control-only receive leaves it alone,
+and whole Consumer surrender drops it once. No catch/discharge policy, second
+queue, task, Arc, public type, manifest or dependency change is selected.
+First correct the incompatible drain[61] characterization to complete[59,61],
+and add cancelled borrowed receive/retry FIFO and whole-owner surrender tests.
+Freeze/review those tests twice before the actual pre-fix debug/optimized runs.
+Carry136 production introductions and858 authored/494 retained verification;
+selected owner ceilings220 production,700 retained/2000 authored verification.
+Close/teardown panic and cost remain separate unproved boundaries.
+Before freezing tests, remove panic-payload downcasts: retain the actual caught
+Err opaquely through cleanup, observe its occurrence and exact native wake count.
+Extend the retry case with a third original refilling the released slot and a
+fresh counting observer. Retrying retained first must publish a wake hint even
+while the ring remains full, then complete the exact three-original FIFO and
+terminal trace. This selected retry law adds no delivery or capacity reservation.
+Before custody inversions, freeze f07fda17 and tests8d0b9f06 after actual
+three native controls pass debug and optimized. First take the retained original
+into a stack local before wake calls: all three after-cleanup custody oracles
+must fail. Separately omit drain's retained-original prepend: the complete
+original drain slice must fail. Finally return a retained original without
+replaying wake hints: the fresh observer's saved wake delta must fail while
+its actual capacity remains Pending. Run each selected test/filter in both
+profiles, retain exact mutant patches/hashes and actual Cargo exits, restore
+byte-exact f07 between variants, then full15 native tests and four focused
+race models in each profile. No caught-panic conversion, new state, dependency,
+close/teardown panic policy, cost or release claim follows.
+
+At exact24ad2b9, add owning tests before implementing the coordinator-selected
+`MailboxRef::wait_for_capacity -> Capacity::{Available, Closed}`. It observes
+capacity without taking a message, acquiring a sender or reserving a slot.
+Use existing actual mailbox/ring state and separate capacity notifications;
+existing sends and their preclose permit law remain distinct. No API is
+implemented by this checkpoint. First expected compilation must fail for the
+missing enum/method, rather than a fixture setup error.
+
+Four finite single-poll tests cover an outside original and no insertion,
+non-stride dequeue notification, closure while an actual preclose send survives,
+consumer teardown, observer withdrawal, another sender taking capacity and
+cancelled borrowed observation. Counting wakers and complete bounded receive
+traces reject missing notifications without hanging. No sleeps, timeouts,
+self-wakes or unbounded polling. Preserve all existing tests. Forecast at most
+350 retained/1000 chronological new test lines; no production, manifest, lock,
+version, dependency or CI edit at this stage. Owner source inversions, native
+Loom, allocation/performance measurements and release verification follow
+separately after source eligibility; this record claims none executed.
+
+Before extending the close test, retain its Pending capacity future unpolled
+through finite terminal/EOF observations, then release it and finish cleanup.
+This rejects an observation that secretly owns a counting sender. Existing
+strided sender-waker panic exposure remains source-only, outside this test
+patch and without a selected repair. The new observer-notification seam needs
+its own promised receive/custody contract before a panic observation can be
+classified as a defect; no catch/discharge policy is selected here.
+
+Before production at the same baseline, coordinator selects the actual owner
+comparison: one Capacity enum and MailboxRef::wait_for_capacity, one separate
+UserLane Notify, guarded existing ring-ticket observation, and wake publication
+after every pop, admission close and consumer teardown. Reuse existing lane
+storage, admission mutex and slot tickets; no sender/permit across await, new
+dependency, default, producer-protocol change or lifecycle product. Limit this
+candidate to120 introduced production lines, with the existing350 retained/
+1000 chronological test allowance carried. Only isolated pinned1.95 focused
+debug/optimized controls follow; Loom, measured costs, races, notification-panic
+custody and release remain unproved. A notification may invoke a panicking
+waker after a slot was removed; this comparison selects no catch/discard policy
+and cannot yet establish the final readiness/receive-panic contract.
+
+Before causal mutations, keep healthy production4cd1f3d7/tests058b immutable.
+Run six exact temporary cuts: remove pop broadcast; restrict it to the old
+stride; remove owner-close broadcast while a preclose sender survives; remove
+consumer-teardown broadcast; hold a counting sender through Pending; and make
+the observer register on existing send_notify without adding a notify_one.
+The first two target the non-stride wake oracle, closure/teardown target their
+named wake counts, the sender lifetime cut targets terminal/EOF while the
+observer is still Pending, and shared notification targets independent
+observer/sender wakes. Every test finishes finite cleanup before its oracle.
+Execute the selected named test in debug/optimized for each cut; require one
+actual intended failure, not compilation, timeout or zero matching tests.
+Restore exact4cd bytes between variants, then execute all12 mailbox-retirement
+tests in both profiles. Carry75 production and497 conservative test
+introductions; forecast at most7 further temporary production introductions,
+within120, with no test changes. Preserve logs and exact mutant source bytes.
+Loom, performance, panic policy and release remain separate pending gates.
+
+Before the race-model stage, coordinator selects one shared private guarded
+Poll<Capacity> probe for the native async path and private blocking models in
+the existing mailbox_admission_tests host. Extend only the existing Loom
+Notify stand-in with broadcast generation, snapshot and wait-while-unchanged;
+keep producer permit/enabled/woken behavior. Add dequeue, preclose-owner,
+consumer-drain and broadcast/competitor-refill models before the missing
+probe/model interface compilation, then implement the actual shared owner.
+No public model method/type, queue, trait, executor, dependency or version.
+Carry82 production/497 conservative test introductions and all source copies;
+select160 cumulative production introductions,500 retained/1600 authored
+verification lines. Focused model/native debug and optimized controls, then
+actual model defects and exact restoration precede broader gates. A branch
+limit is an incomplete exploration, not a semantic failure. Native waker panic
+and cost remain separate unresolved contracts; no policy is selected here.
+
+Before model counterexamples, freeze healthy0449aade. Omit pop, owner-close
+and consumer-teardown broadcasts separately and run their corresponding
+private model in each profile. Separately omit the stand-in's broadcast
+generation increment: the competing-refill model must detect the lost
+pre-registration event. The latter is model-fidelity evidence, not a native
+Tokio defect. Capture the first actual Loom cause (deadlock versus a branch
+limit or compilation failure), restore exact healthy bytes between cuts, and
+run all four private models sequentially after restoration. Preemption bound3
+and default branch bound1000 limit this model claim; no timing, wake-panic,
+arbitrary fairness or whole-service conclusion follows.
+
 `mailbox_channel` separates permission to begin a user delivery from the raw
 user lane's sender liveness. `MailboxOwner` owns that permission;
 `MailboxRef` is a cloneable, non-owning address. Raw `channel`, `UserSender`,

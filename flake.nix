@@ -33,6 +33,11 @@
         bombayCommunication = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           cargoExtraArgs = "--package bombay-communication";
+          nativeBuildInputs = [ pkgs.cargo-nextest ];
+          checkPhaseCargoCommand = ''
+            cargo nextest run --cargo-profile release --locked --package bombay-communication
+            cargo test --release --locked --package bombay-communication --doc
+          '';
         });
       in {
         checks = {
