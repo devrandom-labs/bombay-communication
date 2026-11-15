@@ -2,6 +2,33 @@
 
 ## Consumer publication wakeup — investigation
 
+PR15 at86653d8 failed the live advisory gate for locked Tokio1.53.1:
+[RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386.html)
+requires1.53.3 on this release line. Before editing the lock, select only
+`cargo update -p tokio --precise 1.53.3` through the pinned environment, then
+inspect the complete package delta. Bombay already selects1.53.3. Preserve the
+advisory gate without exceptions. This adds Cargo.lock to the three-file scope;
+no library API/manifest/source change is selected. Tokio's notifier source
+differs between these patches (Context/waker/taskdump handling), so the earlier
+1.53.1 controls/costs below remain historical until the final dependency graph
+passes models, native/Nix/package verification and a comparable cost check.
+Tokio-only delta is exactly one locked version/checksum. Its focused debug
+models, all13 optimized models (240.80seconds), native21 both profiles,
+Clippy and seven Nix checks pass; workspace101 reports no handle warning.
+The fresh `cargo audit --deny unsound` gate then rejects test-only rustix1.1.4:
+[RUSTSEC-2026-0486](https://rustsec.org/advisories/RUSTSEC-2026-0486.html).
+Before its lock edit, select the patched1.1.6 through a precise update and
+inspect the complete delta. The affected package arrives through tempfile/
+proptest. Keep that actual failed audit and all Tokio-only controls; no advisory
+exception, policy/source/API change or new dependency is selected. Final checks
+must use the complete two-patch graph, with earlier receipts source-qualified.
+Both precise updates change only their locked versions/checksums. The final
+graph passes both focused debug models, all13 optimized models (225.46seconds,
+preemption bound3), debug21 custody cases, optimized101 workspace cases,
+strict Clippy, all7 compatible Nix checks and the current1509-entry RustSec
+scan with `--deny unsound`. Final workspace runs report no handle warning.
+The earlier parallel-run warning and its diagnostic controls remain historical.
+
 The retained source candidate delegates both consumer publication and producer
 capacity-release wakes directly to the existing Notify instances. Public syntax
 is unchanged. Both focused models pass in debug, all13 optimized Loom models
@@ -16,15 +43,17 @@ Linux review/merge/publication and Bombay adoption remain open. Neither Bombay
 watchdog failure is established as a consequence of these wakeup protocols.
 
 Two serial same-host benchmark pairs using unchanged Criterion settings compare
-published0.1.6 with this candidate. Owner-reference1024 rounds rise from
-19.60–19.67µs to21.72–21.90µs (10.8–11.4%); raw-anchor rounds rise from
-15.26–15.38µs to17.29–17.35µs (12.4–13.7%). This correctness change accepts
+published0.1.6 source with this candidate, both using the identical patched
+dependency graph. Owner-reference1024 rounds rise from19.17–19.44µs to
+21.68–21.70µs (11.6–13.1%); raw-anchor rounds rise from15.36–15.37µs to
+17.39–17.48µs (13.1–13.8%). This correctness change accepts
 that measured cost; zero-allocation delivery/rejection guards still pass.
 These are aggregate workloads, not isolated instruction cost or an Application
 SLO. OS activity and fixed base-before-candidate order remain limitations.
 The initial candidate benchmark invocation rejected conflicting Criterion
 baseline options; its log is retained. Independent named baselines then
 completed without changing benchmark/source/settings.
+Earlier1.53.1 graph measurements remain source-qualified historical receipts.
 
 The pre-edit laws, counterexamples, controls and selection follow.
 
