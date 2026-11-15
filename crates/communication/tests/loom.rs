@@ -4,12 +4,10 @@
 //! loom-instrumented), so the library swaps `std::sync::atomic`/`Arc` for
 //! loom's under `cfg(loom)`, gates the tokio-`Notify` async paths, and
 //! exposes blocking twins (`send_blocking`/`recv_blocking`) that run the
-//! SAME `parked`/`waiting` flag protocol. The flag checks under loom are
-//! taken under the sync `Notify` stand-in's lock: absent a happens-before
-//! edge loom (correctly, over-approximating hardware) explores
-//! store-buffering executions where a flag read misses an earlier-executed
-//! announcement; the stand-in's mutex supplies the edge real hardware gets
-//! from coherence.
+//! register/recheck/notification protocol. Consumer and producer wake calls
+//! are unconditional in both builds; there is no model-only flag-check lock.
+//! Loom weakens SeqCst accesses to AcqRel. A green bounded model does not
+//! establish unrestricted hardware or executor behavior.
 //!
 //! Explored properties, on every interleaving loom enumerates:
 //! termination (no lost wakeup / no hang — loom fails a deadlocked
@@ -33,16 +31,42 @@
 //! minimal harness. Models run sequentially from one test binary (parallel
 //! `loom::model` executions in one process are not supported).
 //!
-//! Run: `LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS="--cfg loom" cargo test -p
-//! communication --test loom --release`.
+//! Run through the pinned environment:
+//! `nix develop -c env LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS="--cfg loom"
+//! cargo test --locked -p bombay-communication --test loom --release
+//! -- --test-threads=1`.
 #![cfg(loom)]
 
 use communication::{Config, Received, TrySendError, channel, mailbox_channel};
 use loom::sync::atomic::Ordering;
 
 #[test]
+fn consumer_receives_publication_before_sender_retirement() {
+    loom::model(|| {
+        let (control, user, mut receiver) = channel::<u32, Box<u32>>(Config::new(2));
+        let sending = user.clone();
+        let original = Box::new(37);
+        let original_address = original.as_ref() as *const u32 as usize;
+        let producer = loom::thread::spawn(move || {
+            let accepted = sending.try_send(original);
+            accepted.expect("the live consumer has an empty user lane");
+        });
+
+        let received = receiver.recv_blocking();
+        let Some(Received::User(message)) = received else {
+            panic!("the retained owners admit exactly the original user message");
+        };
+        let received_address = message.as_ref() as *const u32 as usize;
+        assert_eq!(received_address, original_address);
+        assert_eq!(*message, 37);
+        producer.join().expect("the original publication completes");
+        drop((message, receiver, control, user));
+    });
+}
+
+#[test]
 fn user_backpressure_wakeup() {
-    // A — user-lane BACKPRESSURE wakeup (`waiting`): the ring is filled
+    // A — user-lane backpressure wakeup: the ring is filled
     // BEFORE the producer starts, so its single send must park until the
     // consumer pops; the consumer's strided and pre-park releases must
     // wake it. Asserts termination, no loss, no duplication, FIFO.
@@ -73,7 +97,7 @@ fn user_backpressure_wakeup() {
 
 #[test]
 fn consumer_wakeup_and_control_chain() {
-    // B — consumer wakeup (`parked`) + control block-chain: 2 producers
+    // B — consumer wakeup + control block-chain: 2 producers
     // race 3 sends across a block boundary (2-slot blocks → claiming,
     // linking, and consumer block-crossing are exercised), then close the
     // lane; the parked consumer must be woken for every push and for the

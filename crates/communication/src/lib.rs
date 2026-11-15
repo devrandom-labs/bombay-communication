@@ -20,13 +20,12 @@
 //!   hold a block hint into them (an `in_flight` registration brackets each
 //!   push's hint window), so the lane does not leak (P8). Control never
 //!   shares the user ring, so a full ring can never delay it.
-//! - **Wakeup** — one shared [`tokio::sync::Notify`] gated by a `parked`
-//!   flag. A producer pays a single atomic load when the consumer is active;
-//!   a parked consumer is woken by `notify_one` after registering with
-//!   enable-then-recheck, so the lost-wakeup class is impossible by
-//!   construction and `recv` stays cancel-safe (no item is moved before the
-//!   consumer is known to be awake to take it). The flag protocol is
-//!   model-checked under `cfg(loom)` (`tests/loom.rs`).
+//! - **Wakeup** — one shared [`tokio::sync::Notify`]. Every publication
+//!   calls `notify_one`, waking a registration or storing one permit.
+//!   The consumer registers before rechecking the lanes, then awaits that
+//!   registration. `recv` stays cancel-safe: no item moves across an await.
+//!   A synchronous notifier models consumer registration and permits under
+//!   `cfg(loom)` (`tests/loom.rs`).
 //!
 //! The public API below is FIXED — the property suite in `communication-testkit`
 //! depends on these exact names and signatures.
@@ -50,9 +49,8 @@ use loom::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
 /// Synchronous stand-in for `tokio::sync::Notify`, used ONLY under
-/// `cfg(loom)`: models tokio's registration semantics explicitly so the
-/// `parked`/`waiting` flag protocol exercised by the loom model matches the
-/// async build. `enable()` arms a registration (the async twins call
+/// `cfg(loom)`: models tokio's consumer registration semantics explicitly.
+/// `enable()` arms a registration (the async twins call
 /// `Notified::enable` at the same points); `notify_one` wakes one
 /// registered waiter or stores a single permit; `notify_waiters` wakes all
 /// registered waiters without storing one. Wake credits are pooled
@@ -61,8 +59,6 @@ use tokio::sync::Notify;
 /// tokio's `Notify`.
 #[cfg(loom)]
 mod sync_notify {
-    use loom::sync::atomic::Ordering;
-
     pub struct Notify {
         state: loom::sync::Mutex<State>,
         cv: loom::sync::Condvar,
@@ -92,50 +88,9 @@ mod sync_notify {
             }
         }
 
-        /// Arm a registration, mirroring `Notified::enable`. ALSO the
-        /// synchronization point of the loom protocol: the caller announces
-        /// its flag (`parked`/`waiting`) BEFORE this call, so the mutex
-        /// release here publishes the announcement to any subsequent
-        /// `notify_if*` lock.
+        /// Arm a registration, mirroring `Notified::enable`.
         pub fn enable(&self) {
             self.state.lock().unwrap().enabled += 1;
-        }
-
-        /// Wake one waiter iff `flag` is set. The flag check happens UNDER
-        /// the lock: if this lock follows the waiter's `enable` in the
-        /// mutex order, the check synchronizes-with the waiter's
-        /// announcement and must observe it; otherwise the waiter's
-        /// post-enable re-check observes whatever this caller published
-        /// before locking. A plain atomic check outside the lock has no
-        /// happens-before edge to the announcement, and loom (correctly
-        /// over-approximating hardware) explores the lost wakeup.
-        pub fn notify_if(&self, flag: &loom::sync::atomic::AtomicBool) {
-            let mut g = self.state.lock().unwrap();
-            if !flag.load(Ordering::SeqCst) {
-                return;
-            }
-            if g.enabled > 0 {
-                g.enabled -= 1;
-                g.woken += 1;
-                self.cv.notify_one();
-            } else {
-                g.permit = true;
-            }
-        }
-
-        /// Wake one waiter iff `n` is nonzero — see `notify_if`.
-        pub fn notify_if_nonzero(&self, n: &loom::sync::atomic::AtomicUsize) {
-            let mut g = self.state.lock().unwrap();
-            if n.load(Ordering::SeqCst) == 0 {
-                return;
-            }
-            if g.enabled > 0 {
-                g.enabled -= 1;
-                g.woken += 1;
-                self.cv.notify_one();
-            } else {
-                g.permit = true;
-            }
         }
 
         pub fn notify_one(&self) {
@@ -184,9 +139,9 @@ mod sync_notify {
         }
 
         /// Lock+unlock with no other effect: a happens-before edge to every
-        /// `notify_if*` that ran before it in the mutex order. The closed
+        /// notification that ran before it in the mutex order. The closed
         /// sweep uses this to observe a departing sender's publishes — the
-        /// sender's pre-decrement `wake_consumer` (a `notify_if` lock) is
+        /// sender's pre-decrement `wake_consumer` (a `notify_one` lock) is
         /// program-ordered before the decrement the consumer observed.
         pub fn sync_point(&self) {
             let _g = self.state.lock().unwrap();
@@ -289,33 +244,14 @@ pub enum Capacity {
 struct Core {
     /// Consumer wakeup. Single waiter (the consumer), `notify_one` suffices.
     notify: Notify,
-    /// Set while the consumer is parked in `notify`; gates the wake call so a
-    /// producer with an active consumer pays one atomic load, nothing more.
-    parked: AtomicBool,
     consumer_gone: AtomicBool,
 }
 
 impl Core {
-    /// Wake the consumer iff it is parked. The check is an RMW, not a plain
-    /// load: absent a happens-before edge, a load may legally miss the
-    /// consumer's earlier `parked` store (store buffering — loom exhibits
-    /// the lost wakeup), while an RMW always observes the newest value in
-    /// the modification order. The consumer's post-store re-check covers
-    /// the other Dekker direction.
-    #[cfg(not(loom))]
+    /// Wake a registered consumer or leave a permit for its next wait.
     #[inline]
     fn wake_consumer(&self) {
-        if self.parked.load(Ordering::SeqCst) {
-            self.notify.notify_one();
-        }
-    }
-
-    /// Wake the consumer iff it is parked — loom variant: the flag check is
-    /// taken under the `Notify` stand-in's lock so it synchronizes with the
-    /// consumer's announcement (see `sync_notify::Notify::notify_if`).
-    #[cfg(loom)]
-    fn wake_consumer(&self) {
-        self.notify.notify_if(&self.parked);
+        self.notify.notify_one();
     }
 }
 
@@ -344,12 +280,10 @@ struct UserLane<U> {
     tail: AtomicUsize,
     /// Next pop ticket; written only by the single consumer.
     head: AtomicUsize,
-    /// Parked-producer wakeup; gated by `waiting`.
+    /// Producer wakeup; each release wakes a registration or stores a permit.
     send_notify: Notify,
     /// Broadcast capacity observations independently of parked senders.
     capacity_notify: Notify,
-    /// Number of producers parked on a full ring (guards `send_notify`).
-    waiting: AtomicUsize,
     /// Live [`UserSender`] handles; lane is closed when this reaches 0.
     senders: AtomicUsize,
     core: Arc<Core>,
@@ -440,7 +374,7 @@ impl<U> UserLane<U> {
             self.head.store(head.wrapping_add(1), Ordering::Relaxed);
             head
         };
-        // Wake one parked producer, if any — checked every 4th pop only;
+        // Wake one producer every eighth pop;
         // a parked producer is also released by the consumer's pre-park
         // check, so it can never sleep past an empty ring.
         if head.is_multiple_of(8) {
@@ -450,21 +384,10 @@ impl<U> UserLane<U> {
         retained_user.take()
     }
 
-    /// Release one parked producer, if any is waiting.
-    #[cfg(not(loom))]
+    /// Wake one registered producer or leave a permit for its next wait.
     #[inline]
     fn release_one_waiter(&self) {
-        if self.waiting.load(Ordering::SeqCst) != 0 {
-            self.send_notify.notify_one();
-        }
-    }
-
-    /// Release one parked producer, if any — loom variant: the `waiting`
-    /// check is taken under the `Notify` stand-in's lock (see
-    /// `sync_notify::Notify::notify_if`).
-    #[cfg(loom)]
-    fn release_one_waiter(&self) {
-        self.send_notify.notify_if_nonzero(&self.waiting);
+        self.send_notify.notify_one();
     }
 
     /// True once every [`UserSender`] is gone.
@@ -880,33 +803,26 @@ impl<U> UserSender<U> {
                 }
                 Err(v) => item = v,
             }
-            // Ring full: register, announce, re-check, then park. The
-            // announce (SeqCst) pairs with the consumer's SeqCst `waiting`
-            // load, so a pop racing this park either wakes us or is seen by
-            // the re-check below.
+            // Ring full: register before rechecking. A concurrent capacity
+            // release wakes this registration or leaves a permit.
             let notified = lane.send_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            lane.waiting.fetch_add(1, Ordering::SeqCst);
             match lane.try_push(item) {
                 Ok(()) => {
-                    lane.waiting.fetch_sub(1, Ordering::Relaxed);
                     lane.core.wake_consumer();
                     return Ok(());
                 }
                 Err(v) => item = v,
             }
-            // Park-gating check (RMW — a plain load may miss the consumer's
-            // earlier teardown store; see `wake_consumer`).
+            // Check teardown again after registering and retrying delivery.
             if lane.core.consumer_gone.load(Ordering::Acquire) {
-                lane.waiting.fetch_sub(1, Ordering::Relaxed);
                 // Teardown raced the registration seam: the item never
                 // linearized (every push attempt handed it back), so it
                 // returns to the caller, exactly once.
                 return Err(UserClosed(item));
             }
             notified.await;
-            lane.waiting.fetch_sub(1, Ordering::Relaxed);
             if lane.core.consumer_gone.load(Ordering::Acquire) {
                 // Teardown released this parked waiter before the item
                 // linearized: return it to the caller, exactly once.
@@ -916,7 +832,7 @@ impl<U> UserSender<U> {
     }
 
     /// Blocking twin of `send`, compiled ONLY under `cfg(loom)`: the same
-    /// announce/re-check/park protocol over `waiting`, with the sync
+    /// register/recheck/park protocol, with the sync
     /// `Notify` stand-in's `wait()` in place of the `Notified` future.
     /// Drives the loom model in `tests/loom.rs`.
     #[cfg(loom)]
@@ -935,44 +851,21 @@ impl<U> UserSender<U> {
                 }
                 Err(v) => item = v,
             }
-            // Ring full: announce (SeqCst), re-check, then park. The
-            // stand-in's `enable` lock publishes the announcement; the
-            // SECOND re-check after it catches any pop the first missed
-            // (the consumer's `notify_if_nonzero` lock covers the other
-            // direction).
-            lane.waiting.fetch_add(1, Ordering::SeqCst);
-            match lane.try_push(item) {
-                Ok(()) => {
-                    lane.waiting.fetch_sub(1, Ordering::Relaxed);
-                    lane.core.wake_consumer();
-                    return Ok(());
-                }
-                Err(v) => item = v,
-            }
-            // Park-gating check (RMW — see `wake_consumer`).
-            if lane.core.consumer_gone.load(Ordering::Acquire) {
-                lane.waiting.fetch_sub(1, Ordering::Relaxed);
-                // Teardown raced the registration seam: the item never
-                // linearized, so it returns to the caller, exactly once.
-                return Err(UserClosed(item));
-            }
+            // Register before rechecking, matching the async producer.
             lane.send_notify.enable();
             match lane.try_push(item) {
                 Ok(()) => {
-                    lane.waiting.fetch_sub(1, Ordering::Relaxed);
                     lane.core.wake_consumer();
                     return Ok(());
                 }
                 Err(v) => item = v,
             }
             if lane.core.consumer_gone.load(Ordering::Acquire) {
-                lane.waiting.fetch_sub(1, Ordering::Relaxed);
                 // Teardown raced the post-registration re-check: the item
                 // never linearized, so it returns to the caller.
                 return Err(UserClosed(item));
             }
             lane.send_notify.wait();
-            lane.waiting.fetch_sub(1, Ordering::Relaxed);
             if lane.core.consumer_gone.load(Ordering::Acquire) {
                 // Teardown released this parked waiter before the item
                 // linearized: return it to the caller, exactly once.
@@ -1512,22 +1405,17 @@ impl<C, U> Consumer<C, U> {
                 return None;
             }
 
-            // Park. Register FIRST, announce parked (SeqCst — pairs with the
-            // producers' SeqCst `parked` load), then re-check: any push or
-            // last-sender drop after the re-check either wakes this
-            // registration or is seen by the re-check itself.
+            // Register before rechecking: a concurrent publication or
+            // last-sender drop wakes this registration or leaves a permit.
             let notified = core.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            core.parked.store(true, Ordering::SeqCst);
 
             if let Some(c) = pop_control!(self) {
-                core.parked.store(false, Ordering::Relaxed);
                 take_control!(c);
             }
             match usr.pop(retained_user) {
                 Some(u) => {
-                    core.parked.store(false, Ordering::Relaxed);
                     take_user!(u);
                 }
                 // The leg must be observable from the PARKED path too: the
@@ -1540,7 +1428,6 @@ impl<C, U> Consumer<C, U> {
                 // — re-pop once so a delivery racing the drop cannot land
                 // an item AFTER the end-marker.
                 None if !*leg_reported && usr.closed() => {
-                    core.parked.store(false, Ordering::Relaxed);
                     if let Some(u) = usr.pop(retained_user) {
                         take_user!(u);
                     }
@@ -1549,21 +1436,19 @@ impl<C, U> Consumer<C, U> {
                 None => {}
             }
             if self.ctl.closed() && usr.closed() {
-                core.parked.store(false, Ordering::Relaxed);
                 continue; // loop around to the sweep-and-`None` path
             }
             // Release one parked producer before sleeping: with the strided
-            // in-pop `waiting` check, this is what guarantees a producer
+            // in-pop notifications, this guarantees a producer
             // parked on a just-drained ring is always woken (its push then
-            // wakes us via `parked`).
+            // wakes us via the consumer notification).
             usr.release_one_waiter();
             notified.await;
-            core.parked.store(false, Ordering::Relaxed);
         }
     }
 
     /// Blocking twin of `recv`, compiled ONLY under `cfg(loom)`: the same
-    /// policy loop and the same `parked`-flag Dekker protocol, with the
+    /// policy loop and consumer registration protocol, with the
     /// sync `Notify` stand-in's `wait()` in place of the `Notified`
     /// future. Drives the loom model in `tests/loom.rs`.
     #[cfg(loom)]
@@ -1635,7 +1520,7 @@ impl<C, U> Consumer<C, U> {
             let usr_closed = usr.closed();
             if ctl_closed && usr_closed {
                 // Both lanes closed. Synchronize with the departing
-                // senders' `notify_if` locks so their publishes are visible
+                // senders' notification locks so their publishes are visible
                 // to the sweep (loom's visibility model does not honor the
                 // atomic release chain alone); then sweep TWICE (see the
                 // async `recv` for why). The sync point also publishes the
@@ -1653,20 +1538,14 @@ impl<C, U> Consumer<C, U> {
                 return None;
             }
 
-            // Park: announce parked FIRST (SeqCst), then register — the
-            // stand-in's `enable` lock is the synchronization point that
-            // publishes the announcement to `notify_if` (and vice versa
-            // for the re-checks below).
-            core.parked.store(true, Ordering::SeqCst);
+            // Register before rechecking, matching the async consumer.
             core.notify.enable();
 
             if let Some(c) = pop_control!(self) {
-                core.parked.store(false, Ordering::Relaxed);
                 take_control!(c);
             }
             match usr.pop(retained_user) {
                 Some(u) => {
-                    core.parked.store(false, Ordering::Relaxed);
                     take_user!(u);
                 }
                 // The leg must be observable from the PARKED path too: the
@@ -1675,7 +1554,6 @@ impl<C, U> Consumer<C, U> {
                 // dead user lane. Same re-pop discipline as
                 // `pop_user_or_leg!` (see the async `recv`).
                 None if !*leg_reported && usr.closed() => {
-                    core.parked.store(false, Ordering::Relaxed);
                     if let Some(u) = usr.pop(retained_user) {
                         take_user!(u);
                     }
@@ -1684,12 +1562,10 @@ impl<C, U> Consumer<C, U> {
                 None => {}
             }
             if self.ctl.closed() && usr.closed() {
-                core.parked.store(false, Ordering::Relaxed);
                 continue;
             }
             usr.release_one_waiter();
             core.notify.wait();
-            core.parked.store(false, Ordering::Relaxed);
         }
     }
 
@@ -1724,23 +1600,19 @@ impl<C, U> Consumer<C, U> {
                 return None;
             }
 
-            // Park with the identical enable-then-recheck `parked` protocol
+            // Park with the identical register-then-recheck protocol
             // as `recv`, minus all user-lane interaction.
             let notified = core.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            core.parked.store(true, Ordering::SeqCst);
 
             if let Some(c) = pop_control!(self) {
-                core.parked.store(false, Ordering::Relaxed);
                 return Some(c);
             }
             if self.ctl.closed() {
-                core.parked.store(false, Ordering::Relaxed);
                 continue; // loop around to the sweep-and-`None` path
             }
             notified.await;
-            core.parked.store(false, Ordering::Relaxed);
         }
     }
 
@@ -1756,7 +1628,7 @@ impl<C, U> Consumer<C, U> {
             if self.ctl.closed() {
                 // Same double-sweep discipline as `recv_blocking`'s
                 // both-closed path: synchronize with the departing control
-                // senders' `notify_if` locks, then sweep TWICE.
+                // senders' notification locks, then sweep TWICE.
                 core.notify.sync_point();
                 if let Some(c) = pop_control!(self) {
                     return Some(c);
@@ -1767,21 +1639,17 @@ impl<C, U> Consumer<C, U> {
                 return None;
             }
 
-            // The identical announce-then-register `parked` protocol as
+            // The identical register-then-recheck protocol as
             // `recv_blocking`, minus all user-lane interaction.
-            core.parked.store(true, Ordering::SeqCst);
             core.notify.enable();
 
             if let Some(c) = pop_control!(self) {
-                core.parked.store(false, Ordering::Relaxed);
                 return Some(c);
             }
             if self.ctl.closed() {
-                core.parked.store(false, Ordering::Relaxed);
                 continue;
             }
             core.notify.wait();
-            core.parked.store(false, Ordering::Relaxed);
         }
     }
 
@@ -1888,7 +1756,6 @@ pub fn channel<C, U>(cfg: Config) -> (ControlSender<C>, UserSender<U>, Consumer<
         .into_boxed_slice();
     let core = Arc::new(Core {
         notify: Notify::new(),
-        parked: AtomicBool::new(false),
         consumer_gone: AtomicBool::new(false),
     });
     let first_block = Box::into_raw(CBlock::new(0));
@@ -1908,7 +1775,6 @@ pub fn channel<C, U>(cfg: Config) -> (ControlSender<C>, UserSender<U>, Consumer<
         head: AtomicUsize::new(0),
         send_notify: Notify::new(),
         capacity_notify: Notify::new(),
-        waiting: AtomicUsize::new(0),
         senders: AtomicUsize::new(1),
         core: core.clone(),
     });

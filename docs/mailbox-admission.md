@@ -1,5 +1,162 @@
 # Mailbox admission
 
+## Consumer publication wakeup — investigation
+
+The retained source candidate delegates both consumer publication and producer
+capacity-release wakes directly to the existing Notify instances. Public syntax
+is unchanged. Both focused models pass in debug, all13 optimized Loom models
+pass at preemption bound3, native21 custody cases pass in both profiles, strict
+workspace Clippy passes and all7 compatible pinned-Nix checks pass on Darwin.
+The workspace Nextest run reports101 passed with one output-handle warning;
+the serial101-case diagnostic passes without that warning. Pinned Nextest0.9.137
+predates its documented Apple capture-pipe fix; this is a possible explanation,
+not a proven cause: https://nexte.st/changelog/ and
+https://nexte.st/docs/features/leaky-tests/ . No timeout/configuration changed.
+Linux review/merge/publication and Bombay adoption remain open. Neither Bombay
+watchdog failure is established as a consequence of these wakeup protocols.
+
+Two serial same-host benchmark pairs using unchanged Criterion settings compare
+published0.1.6 with this candidate. Owner-reference1024 rounds rise from
+19.60–19.67µs to21.72–21.90µs (10.8–11.4%); raw-anchor rounds rise from
+15.26–15.38µs to17.29–17.35µs (12.4–13.7%). This correctness change accepts
+that measured cost; zero-allocation delivery/rejection guards still pass.
+These are aggregate workloads, not isolated instruction cost or an Application
+SLO. OS activity and fixed base-before-candidate order remain limitations.
+The initial candidate benchmark invocation rejected conflicting Criterion
+baseline options; its log is retained. Independent named baselines then
+completed without changing benchmark/source/settings.
+
+The pre-edit laws, counterexamples, controls and selection follow.
+
+At published0.1.6/963067e, preserve the existing contract that a parked consumer
+cannot miss an accepted user publication while mailbox owners remain alive.
+The producer publishes its ring ticket with Release, then conditionally notifies
+from a SeqCst parked load. The consumer registers, stores parked, rechecks the
+ring and waits. A publication must be observed by that recheck or wake its
+registration; sender shutdown must not be needed to rescue a delivery.
+This is an existing derived mailbox progress law, not a new actor fairness or
+bounded-latency guarantee. No new public syntax or state is selected.
+
+The independently downloaded official0.1.6 archive matches cached source and
+checksum e5d5a581c47408d64234b7e89a229b63a333584cfe5c10b6fe656daa2c1e4853.
+Native wake uses a plain parked load despite its RMW comment; the cfg(loom)
+version instead checks under the Notify stand-in mutex. That extra model edge
+is a candidate fidelity defect, not proof of a native defect or of Bombay's
+Linux watchdog cause. Loom0.7.2 models SeqCst accesses as AcqRel and can give
+false alarms; investigate the actual operation ordering and single-flag case,
+not merely a red model. Primary limits and ordering references:
+https://github.com/tokio-rs/loom/blob/master/README.md#unsupported-features
+https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html
+
+Before native production changes, add a focused existing-API Loom witness:
+one producer transfers an original Box through an initially empty user lane;
+the receiving owner retains both durable senders until that exact Box returns.
+A last-sender close cannot rescue a missed publication. First execute the
+unchanged strong model, then make its consumer wake check match the published
+native check without changing the native branch. Preserve every original
+oracle. Scope: this existing document, tests/loom.rs and model-only source in
+src/lib.rs; no dependency, public type or native production changes yet.
+The unchanged stronger model passes the new witness in optimized mode with
+preemption bound3 (one case,12 filtered). This is the pre-edit model control.
+Now replace only the cfg(loom) consumer flag-check operation with the exact
+published native parked load; preserve the native method byte-for-byte.
+Capture the first actual cause, not a timeout or branch-limit surrogate.
+
+The exact native-load model exits101 with consumer blocked and producer
+terminated, not a branch limit; the native method remains byte-identical.
+Before selecting a native repair, strengthen only the model's consumer
+announcement with a supported SeqCst fence, representing a stronger ordering
+than the downgraded modeled store. If it still deadlocks, add a producer fence
+before its parked check as a separate ordering control. These extra model
+edges are temporary experiments, not retained model/native correctness proof.
+Loom's unsupported full SeqCst semantics must not be ignored.
+
+Root ownership, ring tickets and private flags remain unchanged. Review1 maps
+successful transfer and original pointer/value to the progress law; review2
+challenges last-drop rescue, model synchronization and SeqCst false alarms.
+A green strong-model control is not native correctness proof; a model branch
+limit is not a semantic failure.
+
+The consumer-fence-only model also deadlocks; adding a producer fence before
+the flag check makes that ordering control pass. Preserve all four logs and
+exact model variants outside the repository; remove their artificial fences.
+These controls distinguish the missing cross-location ordering from a mere
+weakened consumer store, but do not establish Bombay's Linux watchdog cause.
+
+Before production, select the existing Tokio Notify contract directly:
+every consumer wake request calls notify_one, which wakes a registration or
+stores one permit. Register before checking the lanes, then await that
+registration. Remove the redundant parked field and every store to it rather
+than introducing another fence/flag protocol. Tokio1.53.1 documents this
+permit/registration behavior in src/sync/notify.rs, lines28–46 and118–136.
+The existing original-Box model is the pre-edit regression. Both model and
+native wake methods now use the same unconditional operation. No public API,
+allocation, dependency, queue, policy or new state is selected. Core fields
+decrease3→2 and consumer wake implementations2→1; their conditional branches
+decrease1→0. User/control ordering, sender counts, closure, retained dequeue
+custody, cancellation and capacity notification remain their existing owners.
+The separate producer-wait model still adds synchronization to its conditional
+check; explicitly retain that limitation instead of claiming full model fidelity.
+
+Review1: publication before registration leaves a permit; publication after
+registration wakes it; cancellation can leave only a spurious permit. Review2:
+retained durable owners exclude last-close rescue, exact pointer/value exclude
+replacement or copying, and the change removes the rejected flag cause rather
+than recording its history. Native nonpanicking executor-waker coverage and
+existing custody/closure tests must pass. Foreign-waker panic progress remains
+unsupported under the existing contract. Run the focused model in both profiles,
+then existing Loom models and the owning pinned-Nix checks. Do not equate those
+results with a deterministic reproduction or cure of Bombay's watchdog failures.
+
+Consumer candidate controls pass: focused original-Box model in both profiles,
+all13 bounded optimized Loom models (258.36seconds), native21 custody cases
+in both profiles and all7 Darwin pinned-Nix checks (101 workspace cases).
+Exact source/log hashes are retained outside the repository. No Linux cause
+or publication follows from these controls.
+
+Before retaining this notification change, audit the symmetric producer path.
+Its existing derived law requires a send blocked on a full ring to progress
+after capacity is released, without requiring consumer disposal. The native
+release_one_waiter also conditionally skips Notify after a SeqCst load, while
+the model checks the waiting count under its notifier mutex. Existing
+user_backpressure_wakeup just passed in the complete consumer-candidate run.
+Change only this model check to match native; keep all native candidate bytes
+identical. If it deadlocks, separately add a supported model SeqCst fence after
+the producer's waiting announcement to challenge Loom's weakened SC RMW.
+Do not infer a native defect from a branch limit or silently retain temporary
+ordering edges. This stage selects no producer production repair yet.
+The matching native-check model deadlocks with both consumer and producer
+blocked (exit101), not a branch limit. Now execute the previously recorded
+producer-announcement fence control, keeping native bytes unchanged.
+The supported announcement-fence control also deadlocks with both blocked.
+Before selecting production, add a separate model-only supported fence before
+the consumer's conditional waiting-count check. A pass would distinguish the
+publication/check ordering; remove both experimental fences afterwards.
+
+The paired producer ordering control passes (one case/0.48seconds). All three
+producer model variants/logs are preserved; native bytes remained unchanged.
+Before production, extend the same existing Notify construction to producer
+releases: release_one_waiter unconditionally calls send_notify.notify_one at
+the existing stride/pre-sleep sites. Remove waiting, its updates and the
+model-only conditional notifier method. UserLane fields8→7; producer release
+implementations2→1; gate branches1→0. No public syntax, wake stride, admission,
+payload custody, queue, sender count or shutdown policy changes. The blocking
+send twin registers then rechecks once, matching the native sequence rather
+than adding an extra pre-registration check for the rejected flag protocol.
+Existing user_backpressure_wakeup is the pre-edit law regression. Original
+consumer-Box and all existing native/model tests retain their oracles.
+
+Review1: a release before producer registration leaves a permit; a release
+after registration wakes one producer; competing producers still retry the
+ring and retain their exact input on closure. Review2: waiting owns no domain
+fact beyond whether Notify should be skipped; deleting it removes both the
+ordering race and stale counts after cancellation. No notification-panic
+discharge policy is introduced. Re-run focused models in both profiles, full
+bounded Loom and owning Nix gates for the combined source. Measure existing
+mailbox admission benchmarks against the published base before retaining
+cost claims; correctness does not establish a performance improvement.
+
+
 ## Capacity observation — current verification
 
 The source candidate observes readiness without reserving capacity or a sender.
